@@ -67,6 +67,7 @@ from dlt.extract.incremental.exceptions import (
     JoinSchedulerError,
 )
 from dlt.extract.incremental.context import TimeIntervalContext, get_interval_context
+from dlt.extract.incremental.overlap import OverlapIncremental
 from dlt.extract.items import SupportsPipe, TTableHintTemplate
 from dlt.extract.items_transform import ItemTransform
 from dlt.extract.state import resource_state
@@ -89,6 +90,9 @@ class IncrementalMetricsRow(TypedDict, total=False):
     unfiltered_batches_count: int
     initial_unique_hashes_count: int
     final_unique_hashes_count: int
+    overlap_late_updates_count: int
+    overlap_duplicates_count: int
+    overlap_evicted_versions_count: int
 
 
 class IncrementalCustomMetrics(TypedDict, total=False):
@@ -145,6 +149,17 @@ class Incremental(
             The `open` range disables deduplication logic so it can serve as an optimization when you know cursors don't overlap between pipeline runs.
         range_end: Decide whether the incremental filtering range is `open` or `closed` on the end value side. Default is `open` (exact `end_value` is excluded).
             Setting this to `closed` means that items with the exact same cursor value as the `end_value` are included in the result.
+        overlap_mode: Opt-in event-time overlap mode for sources that re-return an overlapping window and may send late corrections
+            (a correction whose event-time cursor is older than the saved high-water mark). When enabled, the incremental keeps a re-readable
+            lower boundary (`read_boundary`) trailing the high-water mark by `overlap_window`, deduplicates rows by business primary key and a
+            version field, and forwards newer versions of already-seen keys so the destination can upsert them. The boundary only advances with
+            committed pipeline state, so a restart or a repeated run re-reads the same window without losing data. Defaults to False, which keeps
+            the regular forward-only cursor semantics. Requires a `primary_key` and `overlap_window`; use the resource with `write_disposition="merge"`.
+        overlap_window: Size of the re-read window in event-time units. Seconds for datetime cursors, days for date cursors, plain cursor units for
+            numeric cursors. Required when `overlap_mode=True`. Ignored otherwise.
+        version_path: Optional name/JSON path of a record version field used for deduplication in overlap mode. When not set, the cursor value
+            itself acts as the version, so a late correction is detected by the updated cursor. Rows whose version is not newer than the version
+            already seen for the same primary key are dropped as duplicates.
     """
 
     # this is config/dataclass so declare members
@@ -159,6 +174,9 @@ class Incremental(
     duplicate_cursor_warning_threshold: ClassVar[int] = 200
     range_start: TIncrementalRange = "closed"
     range_end: TIncrementalRange = "open"
+    overlap_mode: bool = False
+    overlap_window: Optional[float] = None
+    version_path: Optional[str] = None
 
     # incremental acting as empty
     EMPTY: ClassVar["Incremental[Any]"] = None
@@ -177,11 +195,19 @@ class Incremental(
         lag: Optional[float] = None,
         range_start: TIncrementalRange = "closed",
         range_end: TIncrementalRange = "open",
+        overlap_mode: bool = False,
+        overlap_window: Optional[float] = None,
+        version_path: Optional[str] = None,
     ) -> None:
         # make sure that path is valid
         if cursor_path:
             compile_path(cursor_path)
         self.cursor_path = cursor_path
+        if version_path:
+            compile_path(version_path)
+        self.version_path = version_path
+        self.overlap_mode = overlap_mode
+        self.overlap_window = overlap_window
         if isinstance(last_value_func, str):
             if last_value_func == "min":
                 last_value_func = min
@@ -233,6 +259,9 @@ class Incremental(
             "unfiltered_batches_count": 0,
             "initial_unique_hashes_count": 0,
             "final_unique_hashes_count": 0,
+            "overlap_late_updates_count": 0,
+            "overlap_duplicates_count": 0,
+            "overlap_evicted_versions_count": 0,
         }
         self._custom_metrics: IncrementalCustomMetrics = {
             "incremental": [self._incremental_metrics],
@@ -303,6 +332,10 @@ class Incremental(
         ).items():
             if value is not None:
                 kwargs[key] = value
+        # `overlap_mode` defaults to False so the generic "non-None wins" rule would let
+        # an unrelated partial override silently disable it: keep it enabled whenever
+        # either side opted in
+        kwargs["overlap_mode"] = self.overlap_mode or other.overlap_mode
         # preserve Generic param information
         if hasattr(self, "__orig_class__"):
             constructor = self.__orig_class__
@@ -494,6 +527,45 @@ class Incremental(
                 + str(exc)
             ) from exc
 
+        if self.overlap_mode:
+            from dlt.extract.incremental.exceptions import IncrementalOverlapConfigurationError
+
+            if self.overlap_window is None:
+                raise IncrementalOverlapConfigurationError(
+                    "Event-time overlap mode (`overlap_mode=True`) requires `overlap_window`"
+                    " to be set (seconds for datetime cursors, days for date cursors, plain"
+                    " cursor units for numeric cursors)."
+                )
+            if self.end_value is not None:
+                raise IncrementalOverlapConfigurationError(
+                    "Event-time overlap mode cannot be combined with `end_value`, which runs"
+                    " stateless ranges. Remove `end_value` to use overlap mode."
+                )
+            if self.lag:
+                raise IncrementalOverlapConfigurationError(
+                    "Event-time overlap mode cannot be combined with `lag`: the"
+                    " `overlap_window` already defines the re-read window."
+                )
+            if self.range_start == "open":
+                raise IncrementalOverlapConfigurationError(
+                    "Event-time overlap mode requires a closed start range (`range_start`"
+                    "='closed') so the overlap window is actually re-read."
+                )
+            if self.last_value_func not in (min, max):
+                raise IncrementalOverlapConfigurationError(
+                    "Event-time overlap mode only supports the built-in `min`/`max`"
+                    " `last_value_func`, got"
+                    f" {getattr(self.last_value_func, '__name__', self.last_value_func)}."
+                )
+            if self._primary_key is not None and (
+                isinstance(self._primary_key, (list, tuple)) and len(self._primary_key) == 0
+            ):
+                raise IncrementalOverlapConfigurationError(
+                    "Event-time overlap mode requires a business `primary_key` for"
+                    " deduplication. Passing an empty tuple disables unique checks and is"
+                    " not allowed."
+                )
+
     def parse_native_representation(self, native_value: Any) -> None:
         if isinstance(native_value, Incremental):
             if self is self.EMPTY:
@@ -513,6 +585,9 @@ class Incremental(
             self.allow_external_schedulers = merged.allow_external_schedulers
             self.row_order = merged.row_order
             self.lag = merged.lag
+            self.overlap_mode = merged.overlap_mode
+            self.overlap_window = merged.overlap_window
+            self.version_path = merged.version_path
             # also copy the orig class to preserve cursor type
             if constructor := getattr(self, "__orig_class__", None):
                 pass
@@ -554,6 +629,10 @@ class Incremental(
                     "start_value": self.initial_value,
                 }
             )
+        if self.overlap_mode:
+            # backfill overlap fields on states created before overlap_mode was enabled
+            bound_state.setdefault("read_boundary", bound_state["last_value"])
+            bound_state.setdefault("seen_versions", {})
         return bound_state
 
     @staticmethod
@@ -722,14 +801,19 @@ class Incremental(
             self._join_external_scheduler(ctx)
         # cache state
         self._cached_state = self.get_state()
-        # set start value from last value, in case of a new state those are equal
-        self.start_value = self._get_last_value()
+        if self.overlap_mode:
+            # re-read from the persisted, possibly lagging boundary instead of the
+            # high-water mark so late corrections inside the overlap window come through
+            self.start_value = self._cached_state.get("read_boundary")
+        else:
+            # set start value from last value, in case of a new state those are equal
+            self.start_value = self._get_last_value()
         logger.info(
             f"Bind incremental on {self.resource_name} with initial_value: {self.initial_value},"
             f" start_value: {self.start_value}, end_value: {self.end_value}, func:"
             f" {self.last_value_func.__name__}, row_order: {self.row_order}, on_missing:"
             f" {self.on_cursor_value_missing}, range_start: {self.range_start}, range_end:"
-            f" {self.range_end}"
+            f" {self.range_end}, overlap_mode: {self.overlap_mode}"
         )
         # save existing last value as future start value that will be used only
         # if last value really advances
@@ -773,11 +857,30 @@ class Incremental(
                 None if self.on_cursor_value_missing == "raise" else self.on_cursor_value_missing
             ),
             "resource_name": self.resource_name,
+            "overlap_mode": True if self.overlap_mode else None,
+            "overlap_window": self.overlap_window if self.overlap_mode else None,
+            "version_path": self.version_path if self.overlap_mode else None,
         }
         return simple_repr("dlt.sources.incremental", **without_none(kwargs))
 
     def __str__(self) -> str:
         return self.__repr__()
+
+    def _make_overlap_transformer(self) -> "OverlapIncremental":
+        return OverlapIncremental(
+            resource_name=self.resource_name,
+            cursor_path=self.cursor_path,
+            initial_value=self.initial_value,
+            read_boundary=self._start_value,
+            last_value_func=self.last_value_func,
+            primary_key=self._primary_key,
+            overlap_window=self.overlap_window,
+            version_path=self.version_path,
+            on_cursor_value_missing=self.on_cursor_value_missing,
+            cursor_type=self.get_incremental_value_type(),
+            high_water_mark=self._cached_state.get("last_value"),
+            seen_versions=self._cached_state.get("seen_versions"),
+        )
 
     def _make_or_get_transformer(self, cls: Type[IncrementalTransform]) -> IncrementalTransform:
         if transformer := self._transformers.get(cls):
@@ -808,6 +911,27 @@ class Incremental(
         # `dlt.extract` during dlt startup.
         # TODO: we should consider creating a registry for transforms
         from dlt.dataset.relation import Relation
+        from dlt.extract.incremental.exceptions import IncrementalOverlapUnsupportedItemType
+
+        if self.overlap_mode:
+            # assume list is all of the same type
+            for item in items if isinstance(items, list) else [items]:
+                if is_arrow_object(item) or is_pandas_frame(item) or is_polars_frame(item):
+                    raise IncrementalOverlapUnsupportedItemType(
+                        self.resource_name, type(item).__name__
+                    )
+                if isinstance(item, Relation):
+                    raise IncrementalOverlapUnsupportedItemType(
+                        self.resource_name, "Relation"
+                    )
+            if OverlapIncremental not in self._transformers:
+                # the primary key may be provided via resource hints after construction
+                if not self._primary_key:
+                    raise IncrementalPrimaryKeyMissing(
+                        self.resource_name, "<overlap primary key>", items
+                    )
+                self._transformers[OverlapIncremental] = self._make_overlap_transformer()
+            return self._transformers[OverlapIncremental]
 
         # assume list is all of the same type
         for item in items if isinstance(items, list) else [items]:
@@ -832,6 +956,9 @@ class Incremental(
             return rows
 
         transformer = self._get_transform(rows)
+        if self.overlap_mode:
+            return self._call_overlap(transformer, rows)
+
         if isinstance(rows, list):
             rows = [
                 item
@@ -879,6 +1006,55 @@ class Incremental(
         else:
             cached_state["unique_hashes"] = []
         return rows
+
+    def _call_overlap(
+        self, transformer: "OverlapIncremental", rows: TDataItems
+    ) -> Optional[TDataItems]:
+        """Run a batch through the overlap transformer and write back the rollbackable
+        boundary, high-water mark and bounded version index into cached state."""
+        # rows the transformer passes straight through (e.g. rows without a cursor when
+        # `on_cursor_value_missing='include'`) must not be silently dropped
+        passthrough: List[TDataItem] = []
+        if isinstance(rows, list):
+            for row in rows:
+                emitted_row, _, _ = transformer(row)
+                if emitted_row is not None:
+                    passthrough.append(emitted_row)
+        else:
+            emitted_row, _, _ = transformer(rows)
+            if emitted_row is not None:
+                passthrough.append(emitted_row)
+        # resolve buffered per-key rows against the committed versions once per batch
+        kept, duplicates, updates = transformer.flush_batch()
+        out: Optional[TDataItems] = passthrough + kept if (passthrough or kept) else None
+
+        cached_state = self._cached_state
+        # high-water mark keeps the regular forward-only semantics
+        cached_state["last_value"] = transformer.last_value
+        self._current_last_value = transformer.last_value
+        cached_state["start_value"] = self._cached_state_start_value
+
+        # only move the persisted boundary forward; a batch that did not advance the
+        # high-water mark recomputes the same value anyway
+        persisted_boundary = cached_state.get("read_boundary")
+        new_boundary = transformer.new_boundary
+        if persisted_boundary is None or (
+            new_boundary is not None
+            and self.last_value_func((persisted_boundary, new_boundary)) == new_boundary
+        ):
+            persisted_boundary = new_boundary
+        cached_state["read_boundary"] = persisted_boundary
+
+        # keep the version index bounded to the re-read window
+        evicted = transformer.evict(persisted_boundary)
+        cached_state["seen_versions"] = transformer.seen_versions
+        # boundary dedup hashes are not used in overlap mode
+        cached_state["unique_hashes"] = []
+
+        self._incremental_metrics["overlap_late_updates_count"] += updates
+        self._incremental_metrics["overlap_duplicates_count"] += duplicates
+        self._incremental_metrics["overlap_evicted_versions_count"] += evicted
+        return out
 
     def _check_duplicate_cursor_threshold(
         self, initial_hash_count: int, final_hash_count: int

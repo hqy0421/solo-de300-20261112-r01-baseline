@@ -98,3 +98,16 @@ class ExternalSchedulerNotAvailable(PipeException):
             " (no DLT_INTERVAL_START/DLT_INTERVAL_END env vars, no Airflow context, and no"
             " interval injected by the launcher).",
         )
+
+
+class IncrementalOverlapConfigurationError(DltException):
+    """Raised when the event-time overlap mode is configured with incompatible options."""
+
+
+class IncrementalOverlapUnsupportedItemType(PipeException):
+    def __init__(self, pipe_name: str, item_type: str) -> None:
+        super().__init__(
+            pipe_name,
+            f"Event-time overlap mode (`overlap_mode=True`) does not support {item_type} items"
+            " yet. Yield plain JSON items (dicts / Pydantic models), or disable overlap mode.",
+        )

@@ -290,6 +290,11 @@ const sidebars = {
             "general-usage/incremental/lag",
             {
               type: "doc",
+              id: "general-usage/incremental/overlap-mode",
+              label: "Event-time overlap",
+            },
+            {
+              type: "doc",
               id: "general-usage/incremental/advanced-state",
               label: "State",
             },
