@@ -33,6 +33,9 @@ def _get_ducklake_capabilities() -> DestinationCapabilitiesContext:
     caps.preferred_loader_file_format = "parquet"
     # duckdb and sqllite will crash when loading in parallel, see adjust_capabilities in factory
     caps.loader_parallelism_strategy = "sequential"
+    # ducklake MERGE cannot contain DELETE statements, while sparse updates delete replaced
+    # nested rows and stale records inside the merge
+    caps.supports_sparse_update = False
     return caps
 
 

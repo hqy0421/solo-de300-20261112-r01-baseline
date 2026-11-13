@@ -6,6 +6,8 @@ from dlt.common.json import json
 from dlt.common.metrics import DataWriterMetrics
 from dlt.common.normalizers.json.relational import DataItemNormalizer as RelationalNormalizer
 from dlt.common.normalizers.utils import generate_dlt_ids
+from dlt.common.destination.sparse import SPARSE_UPDATE_HINT
+from dlt.normalize.exceptions import NormalizeException
 from dlt.common.schema.typing import C_DLT_ID
 from dlt.common.schema.utils import dlt_id_column, normalize_table_identifiers
 from dlt.common.schema import TSchemaUpdate, Schema
@@ -158,6 +160,13 @@ class ArrowItemsNormalizer(ItemsNormalizer):
 
     def __call__(self, extracted_items_file: str, root_table_name: str) -> List[TSchemaUpdate]:
         self._maybe_cancel()
+        root_table = self.schema.tables.get(root_table_name)
+        if root_table is not None and root_table.get(SPARSE_UPDATE_HINT):
+            raise NormalizeException(
+                f"Sparse update merge is not supported with the Arrow/Parquet items normalizer on"
+                f" table `{root_table_name}`. Field presence cannot be recovered from columnar"
+                " files. Emit JSON items (the default jsonl normalizer) to use `sparse_update`."
+            )
         # read schema and counts from file metadata
         from dlt.common.libs import pyarrow
         from dlt.common.libs.pyarrow import get_parquet_metadata

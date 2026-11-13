@@ -150,6 +150,65 @@ def test_verify_unsupported_merge_options(write_disposition: str) -> None:
         ]
 
 
+def test_verify_sparse_update_rejected_on_full_row_engines() -> None:
+    """Vector and table-format engines that merge full rows reject sparse updates instead of
+    silently dropping the field-presence markers."""
+
+    @dlt.resource(
+        primary_key="id",
+        columns={"id": {"data_type": "bigint"}},
+        write_disposition={
+            "disposition": "merge",
+            "strategy": "upsert",
+            "sparse_update": True,
+        },
+    )
+    def items():
+        yield [{"id": 1}]
+
+    schema = Schema("test")
+    table = schema.update_table(items().compute_table_schema())
+    caps = Destination.from_reference("lancedb").capabilities()
+    load_table = prepare_load_table(schema.tables, table, caps)
+    exceptions = verify_unsupported_merge_options(
+        schema, [load_table], caps, "lancedb", ("sparse_update",)
+    )
+    assert len(exceptions) == 1
+    assert "`sparse_update`" in str(exceptions[0])
+    assert "`upsert`" in str(exceptions[0])
+
+
+@pytest.mark.parametrize("destination_ref", ["duckdb", "ducklake"])
+def test_verify_sparse_update_destination_capability(destination_ref: str) -> None:
+    """A destination that cannot run sparse merges rejects `sparse_update`; destinations that
+    can accept it."""
+
+    @dlt.resource(
+        primary_key="id",
+        columns={"id": {"data_type": "bigint"}},
+        write_disposition={
+            "disposition": "merge",
+            "strategy": "upsert",
+            "sparse_update": True,
+        },
+    )
+    def items():
+        yield [{"id": 1}]
+
+    schema = Schema("test")
+    table = schema.update_table(items().compute_table_schema())
+    caps = Destination.from_reference(destination_ref).capabilities()
+    load_table = prepare_load_table(schema.tables, table, caps)
+    exceptions = verify_schema_merge_disposition(schema, [load_table], caps)
+    if caps.supports_sparse_update:
+        assert exceptions == []
+    else:
+        # exactly one clean error, not a capability error stacked on a strategy error
+        assert len(exceptions) == 1
+        assert "`sparse_update`" in str(exceptions[0])
+        assert "does not support sparse updates" in str(exceptions[0])
+
+
 @pytest.mark.parametrize("root_strategy", ["delete-insert", "upsert"])
 def test_verify_nested_destination_scope(root_strategy: str, caplog: Any) -> None:
     """A nested table with its own destination scope is verified against its prepared root

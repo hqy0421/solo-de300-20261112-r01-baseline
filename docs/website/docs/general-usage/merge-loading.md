@@ -810,6 +810,57 @@ Without `skip_unchanged_rows`, dlt ignores `row_version_column_name` and logs a 
 
 Set `source_filter` to merge only the loaded records that match a SQL condition. dlt discards the other loaded records. For the rules, read [Merge conditions](#merge-conditions). `upsert` does not delete records that are absent from the loaded data, so it does not support `destination_scope`. The `iceberg` table format and the vector destinations cannot apply a SQL condition, so they reject `source_filter` before the load starts.
 
+### Sparse updates (partial patches)
+
+Set `sparse_update: True` to treat the loaded rows as *partial patches* instead of full records. A regular `upsert` overwrites the whole destination row with the staged one, so any omitted column becomes `NULL`. A sparse update distinguishes a field that is absent from a field explicitly set to `NULL`:
+
+- a field missing from the patch **keeps** its destination value,
+- a field explicitly set to `None` **clears** the destination value,
+- a nested object follows the same rule per leaf field,
+- a nested list present in the patch **replaces** the corresponding list items of the destination record (an empty list clears them), while a missing list leaves the items untouched.
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "upsert",
+        "sparse_update": True,
+    },
+    primary_key="customer_id",
+)
+def customers():
+    # phone omitted -> the old phone is kept; address.city is updated while the other
+    # address fields stay; contacts replaces the whole contact list
+    yield [
+        {
+            "customer_id": 1,
+            "address": {"city": "Berlin"},
+            "contacts": [{"kind": "email", "value": "a@b.c"}],
+        }
+    ]
+```
+
+Several patches with the same primary key inside one load package take effect in the order dlt receives them, so the last provided value wins per field. dlt records field presence in marker columns (`_dlt_sparse_mask__*`, `_dlt_sparse_seq`, `_dlt_sparse_list`) that exist only in the staging tables and are never created in the destination.
+
+To stop a replayed or outdated load package from undoing a newer modification, mark a business version column with the `x-row-version` hint. dlt then applies a patch only when its version is greater than the destination version (a patch without a version always applies):
+
+```py
+@dlt.resource(
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "upsert",
+        "sparse_update": True,
+        "row_version_column_name": "version",
+    },
+    primary_key="customer_id",
+    columns={"version": {"name": "version", "x-row-version": True}},
+)
+def customers():
+    ...
+```
+
+Sparse updates require a column-wise merge, so they work with the `upsert` and `cdc` strategies only; `delete-insert` and `scd2` replace whole rows and reject the option. The normalizers for Arrow tables, Pandas/Polars DataFrames and SQL model objects cannot recover which fields were omitted, so they reject sparse tables too — use the standard JSON (dict) normalizer. Destinations whose `MERGE` cannot delete rows (for example `ducklake`) do not support sparse updates and reject the table before the load starts. When a sparse patch introduces a brand-new nested column, existing destination rows keep `NULL` in that column instead of being cleared.
+
 ### `upsert` versus `delete-insert`
 
 Unlike the default `delete-insert` merge strategy, the `upsert` strategy:
@@ -932,6 +983,8 @@ def my_cdc_resource():
 ```
 
 To detect changes with one column instead of all columns, also set `row_version_column_name`, as described in [Detect changes with your own row version](#detect-changes-with-your-own-row-version).
+
+`cdc` also accepts `sparse_update` (see [Sparse updates (partial patches)](#sparse-updates-partial-patches)): absent fields then keep their destination values and explicit `None` clears them, while records missing from the snapshot are still deleted.
 
 ### `cdc` versus `replace` and `delete-insert`
 

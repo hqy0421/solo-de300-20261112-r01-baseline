@@ -399,7 +399,7 @@ class LanceClient(JobClientBase, WithStateSync, WithSqlClient):
             loaded_tables,
             self.capabilities,
             self.config.destination_type,
-            ("skip_unchanged_rows", "source_filter"),
+            ("skip_unchanged_rows", "source_filter", "sparse_update"),
         ):
             for exception in exceptions:
                 logger.error(str(exception))

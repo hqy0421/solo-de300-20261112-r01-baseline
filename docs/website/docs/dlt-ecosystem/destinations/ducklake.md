@@ -332,6 +332,8 @@ with pipeline.sql_client() as client:  # ty: ignore
 
 All write dispositions are supported. `upsert` and `insert-only` are supported on **duckdb 1.4.x** (without hard deletes for now)
 
+Sparse updates (`sparse_update`) are not supported: DuckLake cannot execute `DELETE` inside a `MERGE` statement, while sparse merges delete replaced nested rows and stale records that way.
+
 ## Data loading
 
 By default, Parquet files and the `COPY` command are used to move local files to the remote storage,

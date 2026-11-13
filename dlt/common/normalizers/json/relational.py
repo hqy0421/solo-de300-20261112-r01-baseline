@@ -7,6 +7,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Type,
     cast,
@@ -37,6 +38,12 @@ from dlt.common.schema.utils import (
     get_first_column_name_with_prop,
 )
 from dlt.common.utils import update_dict_nested
+from dlt.common.destination.sparse import (
+    SPARSE_PRESENCE_KEY,
+    SPARSE_SEQ_KEY,
+    SPARSE_LIST_PATHS_KEY,
+    new_sparse_context,
+)
 from dlt.common.normalizers.json import (
     TNormalizedRowIterator,
     wrap_in_dict,
@@ -75,6 +82,8 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
     propagation_config: RelationalNormalizerConfigPropagation
     max_nesting: int
     _skip_primary_key: Dict[str, bool]
+    _sparse_seq: int
+    _sparse_context: Optional[Dict[str, Any]]
 
     def __init__(self, schema: Schema) -> None:
         """This item normalizer works with nested dictionaries. It flattens dictionaries and descends into lists.
@@ -82,6 +91,8 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         self.schema = schema
         self.naming = schema.naming
         self._load_id: str = None
+        self._sparse_seq = 0
+        self._sparse_context = None
         self._reset()
 
     def _reset(self) -> None:
@@ -185,6 +196,45 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
 
         return out_rec_row, out_rec_list
 
+    def _flatten_sparse(
+        self, table: str, dict_row: DictStrAny, _r_lvl: int, presence: Set[str]
+    ) -> Tuple[DictStrAny, Dict[Tuple[str, ...], Sequence[Any]]]:
+        """Flatten a sparse patch. Unlike `_flatten`, explicit `None` values are kept and every
+        flattened field name (including `None` fields) is recorded in `presence`, so the loader
+        can distinguish "field provided as null" from "field omitted". Inline `json` columns keep
+        their whole subtree: providing one replaces the whole json value."""
+        out_rec_row: DictStrAny = {}
+        out_rec_list: Dict[Tuple[str, ...], Sequence[Any]] = {}
+
+        normalize_identifier = self._normalize_identifier
+        normalize_table_identifier = self._normalize_table_identifier
+        shorten_fragments = self._shorten_fragments
+        is_nested_type = self._is_nested_type
+        EMPTY_KEY = self.EMPTY_KEY_IDENTIFIER
+
+        stack: List[Tuple[Dict[str, Any], int, Tuple[str, ...]]] = [(dict_row, _r_lvl, ())]
+
+        while stack:
+            current_row, r_lvl, path = stack.pop()
+            for k, v in current_row.items():
+                norm_k = normalize_identifier(k) if (k and not k.isspace()) else EMPTY_KEY
+                nested_name = norm_k if not path else shorten_fragments(*path, norm_k)
+                presence.add(nested_name)
+                v_type = type(v)
+                if v_type is dict:
+                    if not is_nested_type(table, nested_name, r_lvl):
+                        stack.append((v, r_lvl - 1, path + (norm_k,)))
+                        continue
+                elif v_type is list:
+                    if not is_nested_type(table, nested_name, r_lvl):
+                        out_rec_list[path + (normalize_table_identifier(k),)] = v
+                        continue
+
+                # keep explicit None values so they reach the staged row and clear the field
+                out_rec_row[nested_name] = v
+
+        return out_rec_row, out_rec_list
+
     def _add_row_id(
         self,
         table: str,
@@ -239,6 +289,7 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         parent_path: Tuple[str, ...],
         parent_row_id: Optional[str] = None,
         _r_lvl: int = 0,
+        sparse: bool = False,
     ) -> TNormalizedRowIterator:
         # cache method lookups
         shorten_fragments = self._shorten_fragments
@@ -252,7 +303,8 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
             v_type = type(v)
             if v_type is dict:
                 yield from self._normalize_row(
-                    v, extend, ident_path, parent_path, parent_row_id, idx, _r_lvl
+                    v, extend, ident_path, parent_path, parent_row_id, idx, _r_lvl,
+                    sparse=sparse,
                 )
             elif v_type is list:
                 # to normalize lists of lists, we must create a tracking intermediary table
@@ -264,6 +316,7 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
                     parent_row_id,
                     idx,
                     _r_lvl - 1,
+                    sparse=sparse,
                 )
             else:
                 # found non-dict in seq, so wrap it
@@ -271,6 +324,9 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
                 if extend:
                     wrap_v.update(extend)
                 self._add_row_id(table, wrap_v, wrap_v, parent_row_id, idx, is_root)
+                if sparse:
+                    # an explicitly provided list marks every emitted nested row
+                    wrap_v[SPARSE_LIST_PATHS_KEY] = self._sparse_context[SPARSE_LIST_PATHS_KEY]
                 yield (table, parent_path, ident_path), wrap_v
 
     def _normalize_row(
@@ -283,10 +339,15 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         pos: Optional[int] = None,
         _r_lvl: int = 0,
         is_root: bool = False,
+        sparse: bool = False,
     ) -> TNormalizedRowIterator:
         table = self._shorten_fragments(*parent_path, *ident_path)
         # flatten current row and extract all lists to recur into
-        flattened_row, lists = self._flatten(table, dict_row, _r_lvl)
+        if sparse:
+            presence: Set[str] = self._sparse_context[SPARSE_PRESENCE_KEY]
+            flattened_row, lists = self._flatten_sparse(table, dict_row, _r_lvl, presence)
+        else:
+            flattened_row, lists = self._flatten(table, dict_row, _r_lvl)
         # only extend row if there's something to extend
         if extend:
             flattened_row.update(extend)
@@ -306,6 +367,22 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
             if propagated:
                 extend = {**extend, **propagated} if extend else propagated
 
+        if sparse:
+            # carry the patch metadata down to nested rows and (root only) stamp the sequence
+            if is_root:
+                flattened_row[SPARSE_SEQ_KEY] = self._sparse_context[SPARSE_SEQ_KEY]
+                flattened_row[SPARSE_PRESENCE_KEY] = presence
+                # only lists present in the root patch replace destination list items
+                for list_path in lists:
+                    self._sparse_context[SPARSE_LIST_PATHS_KEY].add(list_path)
+                flattened_row[SPARSE_LIST_PATHS_KEY] = self._sparse_context[
+                    SPARSE_LIST_PATHS_KEY
+                ]
+            else:
+                flattened_row[SPARSE_LIST_PATHS_KEY] = self._sparse_context[
+                    SPARSE_LIST_PATHS_KEY
+                ]
+
         # yield parent table first
         should_descend = yield (table, parent_path, ident_path), flattened_row
         if should_descend is False:
@@ -322,6 +399,7 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
                     new_parent_path,
                     row_id,
                     _r_lvl - 1,
+                    sparse=sparse,
                 )
 
     def extend_schema(self, extend_tables: bool = True) -> None:
@@ -422,12 +500,23 @@ class DataItemNormalizer(DataItemNormalizerBase[RelationalNormalizerConfig]):
         root_table_name = self._normalize_table_identifier(table_name)
         max_nesting = self._get_table_nesting_level(root_table_name, self.max_nesting)
 
+        root_table = self.schema.tables.get(root_table_name)
+        sparse = bool(root_table and root_table.get("x-merge-sparse-update"))
+        if sparse:
+            self._sparse_seq += 1
+            self._sparse_context = new_sparse_context(self._sparse_seq)
+        else:
+            # always reset the context: one from a previous sparse item must never leak into a
+            # regular table such as the pipeline state table normalized in the same package
+            self._sparse_context = None
+
         yield from self._normalize_row(
             item,
             {},
             (root_table_name,),
             _r_lvl=max_nesting,  # we count backwards
             is_root=True,
+            sparse=sparse,
         )
 
     @classmethod

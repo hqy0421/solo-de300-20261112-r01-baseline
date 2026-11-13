@@ -720,3 +720,27 @@ def test_variant_column_names_preserved(
     assert (
         "nested__col__v_bool" in aliases
     ), f"Variant column 'nested__col__v_bool' was not preserved. Got aliases: {aliases}"
+
+
+@pytest.mark.parametrize("caps", MODEL_CAPS[:1], indirect=True)
+def test_model_normalizer_rejects_sparse_update(
+    caps: DestinationCapabilitiesContext, model_normalize: Normalize
+) -> None:
+    """A SQL model result cannot carry field-presence information, so a sparse update table must
+    be rejected instead of being merged as full rows."""
+    from dlt.common.destination.sparse import SPARSE_UPDATE_HINT
+
+    model = SqlModel.from_query_string(query="SELECT 1 AS id")
+    table = utils.new_table(
+        "my_table",
+        write_disposition="merge",
+        columns=[utils.new_column(column_name="id", data_type="bigint")],
+    )
+    table[SPARSE_UPDATE_HINT] = True
+    schema = Schema("my_schema")
+    schema.update_table(table)
+
+    extract_model(model_normalize.normalize_storage, model, schema, "my_table")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with pytest.raises(NormalizeJobFailed, match="Sparse update merge is not supported"):
+            model_normalize.run(pool)

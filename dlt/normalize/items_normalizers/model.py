@@ -4,6 +4,7 @@ import sqlglot
 
 from dlt.common import logger
 from dlt.common.destination.client import SqlModel
+from dlt.common.destination.sparse import SPARSE_UPDATE_HINT
 from dlt.common.libs.sqlglot import (
     TSqlGlotDialect,
     build_outer_select_statement,
@@ -117,6 +118,13 @@ class ModelItemsNormalizer(ItemsNormalizer):
 
     def __call__(self, extracted_items_file: str, root_table_name: str) -> List[TSchemaUpdate]:
         self._maybe_cancel()
+        root_table = self.schema.tables.get(root_table_name)
+        if root_table is not None and root_table.get(SPARSE_UPDATE_HINT):
+            raise NormalizeException(
+                f"Sparse update merge is not supported with SQL model resources on table"
+                f" `{root_table_name}`: field presence cannot be derived from a query result."
+                " Emit explicit JSON items (the default jsonl normalizer) to use `sparse_update`."
+            )
         with self.normalize_storage.extracted_packages.storage.open_file(
             extracted_items_file, "r"
         ) as f:

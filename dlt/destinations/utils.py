@@ -331,14 +331,46 @@ def verify_schema_merge_disposition(
             # the resource rejects these options for an explicit strategy. Only the destination
             # knows the default strategy
             set_options = _get_merge_options(table)
+            sparse_blocked_by_destination = (
+                set_options["sparse_update"] and not capabilities.supports_sparse_update
+            )
+            if sparse_blocked_by_destination:
+                # a silent fallback to a full-row merge would overwrite or null fields the patch
+                # meant to keep, so this is a hard error
+                exception_log.append(
+                    SchemaCorruptedException(
+                        schema.name,
+                        f"Table `{table_name}` enables `sparse_update`, but this destination does"
+                        " not support sparse updates. Sparse merges require DELETE statements in"
+                        " the merge and temporary tables, which the destination cannot execute."
+                        " Remove `sparse_update` or use a destination that supports it.",
+                    )
+                )
             for option, strategies in MERGE_STRATEGY_OPTIONS.items():
                 if set_options[option] and merge_strategy not in strategies:
                     supported = ", ".join(f"`{s}`" for s in strategies)
-                    log(
-                        f"Table `{table_name}` sets `{option}` with the `{merge_strategy}` merge"
-                        f" strategy. dlt ignores this option, because only the {supported} merge"
-                        " strategies support it. Use one of these strategies or remove the option."
-                    )
+                    if option == "sparse_update":
+                        if sparse_blocked_by_destination:
+                            # the destination capability error above already explains the rejection
+                            continue
+                        # silently falling back to a full-row merge would overwrite or null fields
+                        # that the patch meant to keep, so this is a hard error
+                        exception_log.append(
+                            SchemaCorruptedException(
+                                schema.name,
+                                f"Table `{table_name}` enables `sparse_update` with the"
+                                f" `{merge_strategy}` merge strategy, which replaces whole rows."
+                                " Sparse updates require a column-wise upsert strategy:"
+                                f" {supported}. Set such a strategy or remove `sparse_update`.",
+                            )
+                        )
+                    else:
+                        log(
+                            f"Table `{table_name}` sets `{option}` with the `{merge_strategy}`"
+                            " merge strategy. dlt ignores this option, because only the"
+                            f" {supported} merge strategies support it. Use one of these"
+                            " strategies or remove the option."
+                        )
             if (
                 has_destination_scope
                 and merge_strategy in MERGE_STRATEGY_OPTIONS["destination_scope"]

@@ -28,6 +28,14 @@ from dlt.common.destination.utils import (
     get_scd2_timestamps,
     get_merge_placeholder_values,
 )
+from dlt.common.destination.sparse import (
+    C_SPARSE_LIST,
+    C_SPARSE_SEQ,
+    SPARSE_UPDATE_HINT,
+    list_path_marker_name,
+    mask_column_name,
+    sparse_data_columns,
+)
 from dlt.destinations.exceptions import MergeDispositionException
 from dlt.destinations.job_impl import FollowupJobRequestImpl
 from dlt.destinations.sql_client import SqlClientBase
@@ -186,13 +194,21 @@ class SqlMergeFollowupJob(SqlFollowupJob):
         if merge_strategy == "delete-insert":
             merge_sql = cls.gen_merge_sql(table_chain, sql_client)
         elif merge_strategy in UPSERT_MERGE_STRATEGIES:
-            # cdc is an upsert that also deletes the records absent from the merge source
-            merge_sql = cls.gen_upsert_sql(
-                table_chain,
-                sql_client,
-                delete_absent=merge_strategy == "cdc",
-                skip_unchanged=bool(root_table.get("x-merge-skip-unchanged-rows", False)),
-            )
+            if root_table.get(SPARSE_UPDATE_HINT):
+                # cdc is a sparse upsert that also deletes the records absent from the source
+                merge_sql = cls.gen_sparse_upsert_sql(
+                    table_chain,
+                    sql_client,
+                    delete_absent=merge_strategy == "cdc",
+                )
+            else:
+                # cdc is an upsert that also deletes the records absent from the merge source
+                merge_sql = cls.gen_upsert_sql(
+                    table_chain,
+                    sql_client,
+                    delete_absent=merge_strategy == "cdc",
+                    skip_unchanged=bool(root_table.get("x-merge-skip-unchanged-rows", False)),
+                )
         elif merge_strategy == "insert-only":
             merge_sql = cls.gen_upsert_sql(table_chain, sql_client, insert_only=True)
         elif merge_strategy == "scd2":
@@ -1395,6 +1411,393 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                                 has_nested_subquery=bool(source_filter),
                             )
                         )
+        return sql
+
+    # ------------------------------------------------------------------
+    # sparse update (partial patch) merge
+    # ------------------------------------------------------------------
+    @classmethod
+    def _sparse_dedup_source(
+        cls,
+        staging_table_name: str,
+        primary_keys: Sequence[str],
+        seq_column: str,
+        root_table: PreparedTableSchema,
+        escape_column_id: Callable[[str], str],
+        source_filter: Optional[str],
+    ) -> str:
+        """Collapses all patches of the same primary key inside the batch into one row.
+
+        For every masked data column it keeps the value from the highest-sequence patch that
+        actually provides that column (its mask is TRUE); rows that omit the column sort last via
+        the NULL ordering key. Note that `IGNORE NULLS` must NOT be used on the value: an explicit
+        NULL with a TRUE mask is a deliberate clear and has to be kept. The resulting row therefore
+        applies the patches in business-version order while keeping the subtrees a patch does not
+        mention. The sequence is the maximum, so the composed row behaves like the newest patch.
+        """
+        keys = ", ".join(primary_keys)
+        select_parts: List[str] = list(primary_keys)
+        for column_name in sparse_data_columns(root_table):
+            escaped = escape_column_id(column_name)
+            mask_name = mask_column_name(column_name)
+            if mask_name in root_table["columns"]:
+                mask_ref = escape_column_id(mask_name)
+                select_parts.append(
+                    f"FIRST_VALUE({escaped}) OVER (PARTITION BY {keys} ORDER BY CASE WHEN"
+                    f" {mask_ref} IS TRUE THEN {seq_column} ELSE NULL END DESC NULLS LAST) AS"
+                    f" {escaped}"
+                )
+                select_parts.append(
+                    f"BOOL_OR({mask_ref}) OVER (PARTITION BY {keys}) AS {mask_ref}"
+                )
+            else:
+                # no mask column was ever staged: take the value of the newest patch
+                select_parts.append(
+                    f"FIRST_VALUE({escaped}) OVER (PARTITION BY {keys} ORDER BY {seq_column}"
+                    f" DESC) AS {escaped}"
+                )
+        select_parts.append(f"MAX({seq_column}) OVER (PARTITION BY {keys}) AS {seq_column}")
+        where = f" WHERE {source_filter}" if source_filter else ""
+        inner = (
+            f"SELECT {', '.join(select_parts)} FROM {staging_table_name}{where}"
+        )
+        return (
+            f"(SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY"
+            f" {seq_column} DESC) AS _dlt_sparse_rn FROM ({inner})) AS _dlt_window"
+            " WHERE _dlt_sparse_rn = 1)"
+        )
+
+    @classmethod
+    def _sparse_stale_guard(
+        cls,
+        root_table: PreparedTableSchema,
+        escape_column_id: Callable[[str], str],
+    ) -> Optional[str]:
+        """Builds the optional condition that stops an outdated or replayed patch from undoing a
+        newer modification.
+
+        When the table declares a business version column (`x-row-version`), a matched destination
+        row is only touched when the composed patch carries a strictly newer version. An old patch
+        replayed in a later load then matches but neither updates nor deletes anything, and its
+        nested lists are not replaced either. Returns `None` without a row-version column, in
+        which case every patch is considered newer than the destination state.
+        """
+        version_col = get_first_column_name_with_prop(root_table, "x-row-version")
+        if not version_col:
+            return None
+        v = escape_column_id(version_col)
+        return f"(s.{v} IS NULL OR s.{v} > d.{v})"
+
+    @classmethod
+    def _sparse_root_update_set(
+        cls,
+        root_table: PreparedTableSchema,
+        escape_column_id: Callable[[str], str],
+    ) -> str:
+        """Builds the column-wise UPDATE SET clause of a sparse root merge.
+
+        For every data column `c` with a presence mask `m`:
+            `c = CASE WHEN s.m IS TRUE THEN s.c ELSE d.c END`
+        which keeps the destination value when the patch omits the column and applies the staged
+        value (including NULL, i.e. an explicit clear) when the patch provides it.
+        """
+        assignments: List[str] = []
+        for column_name in sparse_data_columns(root_table):
+            escaped = escape_column_id(column_name)
+            mask_name = mask_column_name(column_name)
+            if mask_name in root_table["columns"]:
+                mask_ref = f"s.{escape_column_id(mask_name)}"
+                assignments.append(
+                    f"{escaped} = CASE WHEN {mask_ref} IS TRUE THEN s.{escaped} ELSE d.{escaped} END"
+                )
+            else:
+                # no mask column was ever staged: always take the staged value
+                assignments.append(f"{escaped} = s.{escaped}")
+        return ", ".join(assignments)
+
+    @classmethod
+    def _sparse_root_insert_columns(
+        cls,
+        root_table: PreparedTableSchema,
+        escape_column_id: Callable[[str], str],
+    ) -> Tuple[str, str]:
+        """Returns the (insert column list, value list) for the NOT MATCHED branch. Marker columns
+        are not stored in the destination table, so they are excluded; masked data columns that a
+        patch omits insert as NULL."""
+        data_columns = sparse_data_columns(root_table)
+        col_str = ", ".join(escape_column_id(c) for c in data_columns)
+        val_str = ", ".join(f"s.{escape_column_id(c)}" for c in data_columns)
+        return col_str, val_str
+
+    @classmethod
+    def gen_sparse_upsert_sql(
+        cls,
+        table_chain: Sequence[PreparedTableSchema],
+        sql_client: SqlClientBase[Any],
+        delete_absent: bool = False,
+    ) -> List[str]:
+        """Generates the sparse update merge statements.
+
+        Root table:
+          * all patches of a key in the batch are folded in business-version order (newest value
+            per present column wins; omitted columns keep their prior/destination value),
+          * present columns overwrite destination columns, omitted columns keep them,
+          * explicit NULL clears a column via the presence mask.
+
+        Nested tables:
+          * rows of lists the patch provides replace only those list items of the affected roots,
+          * lists the patch omits are left untouched.
+        """
+        sql: List[str] = []
+        root_table = table_chain[0]
+        root_table_name, staging_root_table_name = sql_client.get_qualified_table_names(
+            root_table["name"]
+        )
+        escape_column_id = sql_client.escape_column_name
+        escape_lit = sql_client.capabilities.escape_literal or escape_ansi_literal
+
+        primary_keys = cls._escape_list(
+            get_columns_names_with_prop(root_table, "primary_key"),
+            escape_column_id,
+        )
+        hard_delete_col, deleted_cond = cls._get_hard_delete_col_and_cond(
+            root_table, escape_column_id, escape_lit
+        )
+        source_filter, _ = cls.get_merge_conditions(root_table, sql_client)
+        seq_column = escape_column_id(C_SPARSE_SEQ)
+
+        nested_tables = table_chain[1:]
+        root_row_key_column: Optional[str] = None
+        if nested_tables:
+            root_row_key_column = escape_column_id(
+                cls.get_row_key_col(
+                    table_chain,
+                    root_table,
+                    sql_client.fully_qualified_dataset_name(),
+                    sql_client.fully_qualified_dataset_name(staging=True),
+                )
+            )
+
+        if delete_absent:
+            sql.extend(
+                cls._gen_delete_absent_sql(
+                    table_chain, sql_client, primary_keys, root_row_key_column
+                )
+            )
+
+        # fold all same-key patches of the batch into a single composed row
+        sparse_source = cls._sparse_dedup_source(
+            staging_root_table_name,
+            primary_keys,
+            seq_column,
+            root_table,
+            escape_column_id,
+            source_filter,
+        )
+
+        on_str = " AND ".join([f"d.{c} = s.{c}" for c in primary_keys])
+        update_set = cls._sparse_root_update_set(root_table, escape_column_id)
+        insert_cols, insert_vals = cls._sparse_root_insert_columns(root_table, escape_column_id)
+        stale_guard = cls._sparse_stale_guard(root_table, escape_column_id)
+
+        # when stale-patch protection is active and there are nested tables, materialize the row
+        # keys of the roots whose patch is newer than their *current* destination row BEFORE the
+        # root merge runs (it would otherwise already overwrite the version the comparison needs)
+        fresh_roots_table: Optional[str] = None
+        if stale_guard is not None and nested_tables and primary_keys:
+            fresh_select = cls._sparse_fresh_roots_select(
+                table_chain[0],
+                sql_client,
+                staging_root_table_name,
+                root_table_name,
+                root_row_key_column,
+                primary_keys,
+            )
+            fresh_roots_table = cls._new_temp_table_name(root_table["name"], "spfresh", sql_client)
+            sql.append(
+                cls._to_temp_table(
+                    fresh_select, fresh_roots_table, root_row_key_column.strip('"'), sql_client
+                )
+            )
+
+        # an outdated or replayed patch must neither update nor hard-delete a newer destination row
+        if hard_delete_col is None:
+            delete_str = ""
+        elif stale_guard is not None:
+            delete_str = f"WHEN MATCHED AND s.{deleted_cond} AND {stale_guard} THEN DELETE"
+        else:
+            delete_str = f"WHEN MATCHED AND s.{deleted_cond} THEN DELETE"
+        update_when = "WHEN MATCHED" if stale_guard is None else f"WHEN MATCHED AND {stale_guard}"
+        insert_when = (
+            "WHEN NOT MATCHED"
+            if hard_delete_col is None
+            else f"WHEN NOT MATCHED AND (s.{deleted_cond} IS NULL OR NOT s.{deleted_cond})"
+        )
+        sql.append(f"""
+            MERGE INTO {root_table_name} d USING {sparse_source} s
+            ON {on_str}
+            {delete_str}
+            {update_when}
+                THEN UPDATE SET {update_set}
+            {insert_when}
+                THEN INSERT ({insert_cols}) VALUES ({insert_vals});
+        """)
+
+        # nested tables: replace only the list items belonging to lists the patch provides
+        if nested_tables:
+            filtered_root_keys = cls.gen_filtered_root_keys_sql(
+                staging_root_table_name, root_row_key_column, source_filter
+            )
+            for table in nested_tables:
+                sql.extend(
+                    cls._gen_sparse_nested_sql(
+                        table_chain,
+                        table,
+                        sql_client,
+                        root_row_key_column,
+                        filtered_root_keys,
+                        staging_root_table_name,
+                        fresh_roots_table,
+                    )
+                )
+        return sql
+
+    @classmethod
+    def _sparse_fresh_roots_select(
+        cls,
+        root_table: PreparedTableSchema,
+        sql_client: SqlClientBase[Any],
+        staging_root_table_name: str,
+        root_table_name: str,
+        root_row_key_column: str,
+        primary_keys: Sequence[str],
+    ) -> str:
+        """Selects the row keys of the staged roots whose patch is newer than the current
+        destination row, plus the keys of roots that do not exist in the destination yet.
+
+        The correlation uses the stable primary keys: a root merge rewrites the destination row
+        `_dlt_id`, so it cannot be used to compare against the pre-merge destination state.
+        """
+        escape_column_id = sql_client.escape_column_name
+        version_col = get_first_column_name_with_prop(root_table, "x-row-version")
+        v = escape_column_id(version_col)
+        pk_join = " AND ".join(f"sr.{c} = dr.{c}" for c in primary_keys)
+        pk_exists = " AND ".join(f"dr2.{c} = sr2.{c}" for c in primary_keys)
+        return (
+            f"SELECT sr.{root_row_key_column} FROM {staging_root_table_name} sr INNER JOIN"
+            f" {root_table_name} dr ON {pk_join} WHERE sr.{v} IS NULL OR sr.{v} > dr.{v}"
+            f" UNION ALL SELECT sr2.{root_row_key_column} FROM {staging_root_table_name} sr2"
+            f" WHERE NOT EXISTS (SELECT 1 FROM {root_table_name} dr2 WHERE {pk_exists})"
+        )
+
+    @classmethod
+    def _gen_sparse_nested_sql(
+        cls,
+        table_chain: Sequence[PreparedTableSchema],
+        table: PreparedTableSchema,
+        sql_client: SqlClientBase[Any],
+        root_row_key_column: str,
+        filtered_root_keys: str,
+        staging_root_table_name: str,
+        fresh_roots_table: Optional[str] = None,
+    ) -> List[str]:
+        """Merges one nested table of a sparse update.
+
+        Rows flagged with the sparse list marker belong to lists the patch explicitly provides;
+        only the nested items of their root keys are replaced. Roots whose patch omits this list
+        keep their existing nested rows. A root-level marker also covers a list provided as an
+        empty array, which emits no nested rows and therefore no per-row markers.
+
+        `fresh_roots_table` is a temp table (materialized before the root merge) holding the row
+        keys of roots whose patch is newer than their destination row. When provided, replaying an
+        old patch cannot replace or delete the list items of a newer record.
+        """
+        escape_column_id = sql_client.escape_column_name
+        table_name, staging_table_name = sql_client.get_qualified_table_names(table["name"])
+        nested_row_key_column = escape_column_id(
+            cls.get_row_key_col(
+                table_chain,
+                table,
+                sql_client.fully_qualified_dataset_name(),
+                sql_client.fully_qualified_dataset_name(staging=True),
+            )
+        )
+        nested_root_key_column = escape_column_id(
+            cls.get_root_key_col(
+                table_chain,
+                table,
+                sql_client.fully_qualified_dataset_name(),
+                sql_client.fully_qualified_dataset_name(staging=True),
+            )
+        )
+        list_marker = escape_column_id(C_SPARSE_LIST)
+        # root marker column exists only when some patch in the package provided this list
+        root_list_marker_name = list_path_marker_name(table["name"])
+        root_list_marker = escape_column_id(root_list_marker_name)
+        has_root_marker = root_list_marker_name in table_chain[0]["columns"]
+
+        # the row keys of roots allowed to replace list items: every staged root without stale
+        # protection, otherwise only the fresh roots computed before the root merge
+        if fresh_roots_table is not None:
+            fresh_root_keys = f"SELECT {root_row_key_column} FROM {fresh_roots_table}"
+        else:
+            fresh_root_keys = f"SELECT {root_row_key_column} FROM {staging_root_table_name}"
+
+        # the staged rows of the explicitly provided lists, for roots matching the source filter
+        # and not rejected as outdated
+        staged_source = (
+            f"(SELECT * FROM {staging_table_name} WHERE {list_marker} IS TRUE AND"
+            f" {nested_root_key_column} IN ({filtered_root_keys}) AND {nested_root_key_column} IN"
+            f" ({fresh_root_keys}))"
+        )
+        # data columns only: the list marker never reaches the destination table
+        data_columns = sparse_data_columns(table)
+        col_str = ", ".join(escape_column_id(c) for c in data_columns)
+        val_str = ", ".join(f"s.{escape_column_id(c)}" for c in data_columns)
+        update_str = ", ".join(
+            f"{escape_column_id(c)} = s.{escape_column_id(c)}" for c in data_columns
+        )
+
+        sql = [f"""
+            MERGE INTO {table_name} d USING {staged_source} s
+            ON d.{nested_row_key_column} = s.{nested_row_key_column}
+            WHEN MATCHED
+                THEN UPDATE SET {update_str}
+            WHEN NOT MATCHED
+                THEN INSERT ({col_str}) VALUES ({val_str});
+        """]
+
+        # delete destination nested rows of the affected roots that are no longer in the staged
+        # list (the explicit array replaces the corresponding child items). Two sources describe
+        # affected roots: per-row list markers (non-empty lists) and the root marker (also covers
+        # an explicitly empty list that emitted no nested rows). Outdated roots are excluded so a
+        # replayed patch cannot wipe the list items of a newer record.
+        affected_root_keys = (
+            f"SELECT DISTINCT {nested_root_key_column} FROM {staging_table_name}"
+            f" WHERE {list_marker} IS TRUE"
+        )
+        if has_root_marker:
+            affected_root_keys += (
+                f" UNION SELECT {root_row_key_column} FROM {staging_root_table_name}"
+                f" WHERE {root_list_marker} IS TRUE"
+            )
+        kept_row_keys = (
+            f"SELECT {nested_row_key_column} FROM {staging_table_name} WHERE"
+            f" {list_marker} IS TRUE"
+        )
+        removed_cond = (
+            f"{nested_root_key_column} IN ({affected_root_keys}) AND {nested_root_key_column}"
+            f" IN ({fresh_root_keys}) AND {nested_row_key_column} NOT IN ({kept_row_keys})"
+        )
+        sql.extend(
+            cls.gen_delete_where_sql(
+                table_name,
+                removed_cond,
+                [nested_row_key_column],
+                sql_client,
+                has_nested_subquery=True,
+            )
+        )
         return sql
 
     @classmethod

@@ -109,6 +109,7 @@ from dlt.destinations.impl.filesystem.iceberg_adapter import (
 )
 from dlt.destinations import path_utils
 from dlt.destinations.fs_client import FSClientBase
+from dlt.common.destination.sparse import SPARSE_UPDATE_HINT
 from dlt.destinations.utils import (
     verify_schema_merge_disposition,
     verify_schema_replace_disposition,
@@ -908,6 +909,21 @@ class FilesystemClient(
                 merge_strategy = resolve_merge_strategy(
                     self.schema.tables, table, self.capabilities, is_prepared=True
                 )
+                # the deltalake merge overwrites matched rows with the staged (full) row and has
+                # no access to the sparse presence markers, so partial patches cannot be applied
+                if (
+                    merge_strategy in UPSERT_MERGE_STRATEGIES
+                    and table.get(SPARSE_UPDATE_HINT)
+                ):
+                    exception_log.append(
+                        SchemaCorruptedException(
+                            self.schema.name,
+                            "dlt does not support `sparse_update` with the"
+                            f" `{merge_strategy}` merge strategy on Delta table"
+                            f" `{table['name']}`. Merge into a SQL destination instead or remove"
+                            " `sparse_update`.",
+                        )
+                    )
                 # the job merges each Delta table alone, so root row conditions miss nested rows
                 has_nested_tables = any(
                     has_table_seen_data(nested_table)
@@ -968,7 +984,7 @@ class FilesystemClient(
                         [table],
                         self.capabilities,
                         "iceberg",
-                        ("source_filter", "skip_unchanged_rows"),
+                        ("source_filter", "skip_unchanged_rows", "sparse_update"),
                     )
                 )
         return exception_log

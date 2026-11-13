@@ -62,6 +62,20 @@ C_VERSION_SCHEMA_VERSION_LABEL = "_dlt_schema_version"
 """Label of the implicit TTableReference between {LOAD_TABLE_NAME} and {VERSION_TABLE_NAME} for schema version."""
 C_VERSION_SCHEMA_NAME_LABEL = "_dlt_schema_name"
 """Label of the implicit TTableReference between {LOAD_TABLE_NAME} and {VERSION_TABLE_NAME} for schema name."""
+C_SPARSE_MASK_PREFIX = "_dlt_sparse_mask__"
+"""Prefix of the boolean presence-mask columns generated for a sparse update merge. A column
+named `{prefix}{column}` is `True` when the staged patch explicitly provides `column` (including
+an explicit `None` that clears it) and missing/`False` when the patch leaves `column` untouched."""
+C_SPARSE_SEQ = "_dlt_sparse_seq"
+"""Monotonic position of a sparse patch within its load package. Patches of the same primary key
+in one batch take effect in this order, so the loader keeps the highest-sequence patch."""
+C_SPARSE_LIST = "_dlt_sparse_list"
+"""Boolean set on nested-table rows that a sparse patch explicitly provides. The loader only
+replaces the nested list items of root keys that have at least one staged row marked with it."""
+C_SPARSE_LIST_PREFIX = "_dlt_sparse_list__"
+"""Prefix of the root-table boolean markers recording that a patch explicitly provides a nested
+list (named after the nested table). Unlike `C_SPARSE_LIST`, these survive an empty list, which
+emits no nested rows of its own, so the loader can still clear the destination list items."""
 
 TColumnProp = Literal[
     "name",
@@ -172,6 +186,12 @@ TColumnProcessingHints = TypedDict(
     "TColumnProcessingHints",
     {
         "x-normalizer": Optional[Dict[str, Any]],
+        "x-row-version": Optional[bool],
+        "x-valid-from": Optional[bool],
+        "x-valid-to": Optional[bool],
+        "x-active-record-timestamp": Optional[Any],
+        "x-sparse-mask": Optional[bool],
+        "x-sparse-list": Optional[bool],
     },
     total=False,
 )
@@ -238,6 +258,11 @@ class NormalizerInfo(TypedDict, total=True):
     new_table: bool
 
 
+TWriteDisposition = Literal["skip", "append", "replace", "merge"]
+TLoaderMergeStrategy = Literal["delete-insert", "scd2", "upsert", "insert-only", "cdc"]
+TLoaderReplaceStrategy = Literal["truncate-and-insert", "insert-from-staging", "staging-optimized"]
+
+
 # Part of Table containing processing hints added by pipeline stages
 TTableProcessingHints = TypedDict(
     "TTableProcessingHints",
@@ -245,26 +270,32 @@ TTableProcessingHints = TypedDict(
         "x-normalizer": Optional[Dict[str, Any]],
         "x-loader": Optional[Dict[str, Any]],
         "x-extractor": Optional[Dict[str, Any]],
+        "x-merge-strategy": Optional[TLoaderMergeStrategy],
+        "x-merge-source-filter": Optional[str],
+        "x-merge-destination-scope": Optional[str],
+        "x-merge-skip-unchanged-rows": Optional[bool],
+        "x-stage-data-deduplicated": Optional[bool],
+        "x-merge-sparse-update": Optional[bool],
     },
     total=False,
 )
-
-
-TWriteDisposition = Literal["skip", "append", "replace", "merge"]
-TLoaderMergeStrategy = Literal["delete-insert", "scd2", "upsert", "insert-only", "cdc"]
-TLoaderReplaceStrategy = Literal["truncate-and-insert", "insert-from-staging", "staging-optimized"]
 
 
 WRITE_DISPOSITIONS: Sequence[TWriteDisposition] = sorted(get_args(TWriteDisposition))
 MERGE_STRATEGIES: Sequence[TLoaderMergeStrategy] = sorted(get_args(TLoaderMergeStrategy))
 UPSERT_MERGE_STRATEGIES: Sequence[TLoaderMergeStrategy] = ("upsert", "cdc")
 """Strategies that merge by primary key and share the `upsert` options."""
+# a sparse update merge only supports the column-wise upsert strategies. `delete-insert` replaces
+# whole rows and `scd2` versions them, so neither can preserve fields missing from a patch.
+SPARSE_UPDATE_MERGE_STRATEGIES: Sequence[TLoaderMergeStrategy] = ("upsert", "cdc")
 MERGE_STRATEGY_OPTIONS: Dict[str, Sequence[TLoaderMergeStrategy]] = {
     "source_filter": ("delete-insert", "scd2", "upsert", "cdc"),
     # only strategies that delete or retire absent destination records have a destination scope
     "destination_scope": ("delete-insert", "scd2", "cdc"),
     "skip_unchanged_rows": UPSERT_MERGE_STRATEGIES,
     "row_version_column_name": ("scd2", "upsert", "cdc"),
+    # only the column-wise upsert strategies can keep fields absent from a sparse patch
+    "sparse_update": SPARSE_UPDATE_MERGE_STRATEGIES,
 }
 """Merge strategy options and the strategies that support them."""
 MERGE_DISPOSITION_HINTS: Dict[str, str] = {
@@ -273,9 +304,11 @@ MERGE_DISPOSITION_HINTS: Dict[str, str] = {
     "source_filter": "x-merge-source-filter",
     "destination_scope": "x-merge-destination-scope",
     "skip_unchanged_rows": "x-merge-skip-unchanged-rows",
+    "sparse_update": "x-merge-sparse-update",
 }
 """Table hints that store the keys of the merge write disposition dict. The column names in the
 dict, like `row_version_column_name`, mark their columns with column hints instead."""
+
 REPLACE_STRATEGIES: Sequence[TLoaderReplaceStrategy] = sorted(get_args(TLoaderReplaceStrategy))
 
 DEFAULT_VALIDITY_COLUMN_NAMES = ["_dlt_valid_from", "_dlt_valid_to"]
@@ -289,6 +322,10 @@ class TWriteDispositionDict(TypedDict):
 class TMergeDispositionDict(TWriteDispositionDict):
     strategy: NotRequired[TLoaderMergeStrategy]
     """The destination picks its default strategy when not set."""
+    sparse_update: NotRequired[bool]
+    """If `True`, dlt treats the loaded rows as sparse patches: fields missing from a row keep
+    their destination value, while an explicit `None` clears the field. Requires a column-wise
+    upsert merge strategy (`upsert` or `cdc`)."""
 
 
 class TReplaceDispositionDict(TWriteDispositionDict):
@@ -339,6 +376,11 @@ class TUpsertOptionsDict(TypedDict):
     row_version_column_name: NotRequired[str]
     """Column that changes when a record changes. With `skip_unchanged_rows`, dlt compares only
     this column to detect changed records."""
+    sparse_update: NotRequired[bool]
+    """If `True`, dlt treats the loaded rows as sparse patches: fields missing from a row keep
+    their destination value, while an explicit `None` clears the field. Nested list items present
+    in the patch replace the corresponding items of the destination record. Defaults to `False`,
+    where every loaded row replaces the whole destination record."""
 
 
 class TUpsertStrategyDict(

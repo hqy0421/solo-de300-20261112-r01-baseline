@@ -13,8 +13,22 @@ from dlt.common.json import (
     custom_pua_decode_nested,
     may_have_pua,
 )
+from dlt.common.destination.sparse import (
+    SPARSE_LIST_PATHS_KEY,
+    SPARSE_PRESENCE_KEY,
+    SPARSE_SEQ_KEY,
+    get_sparse_context,
+    make_list_marker_column,
+    make_list_path_marker_column,
+    make_mask_column,
+    make_seq_column,
+    mask_column_name,
+    strip_sparse_context,
+)
 from dlt.common.schema import utils
 from dlt.common.schema.typing import (
+    C_SPARSE_LIST,
+    C_SPARSE_SEQ,
     TColumnSchema,
     TPartialTableSchema,
     TSchemaEvolutionMode,
@@ -121,6 +135,9 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                         should_descend = False
                         continue
 
+                    # sparse patches carry their presence metadata in private row keys
+                    sparse_ctx = get_sparse_context(row)
+
                     # filter row, may eliminate some or all fields
                     row = self._filter_row(table_name, row)
                     # do not process empty rows
@@ -154,7 +171,9 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                                 custom_pua_decode_nested(v)
 
                     # coerce row of values into schema table, generating partial table with new columns if any
-                    row, partial_table = self._coerce_row(table_name, parent_table, row)
+                    row, partial_table = self._coerce_row(
+                        table_name, parent_table, row, keep_nulls=sparse_ctx is not None
+                    )
 
                     # if we detect a migration, check schema contract
                     if partial_table:
@@ -206,6 +225,18 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                     if not columns:
                         columns = schema.get_table_columns(table_name)
                         column_schemas[table_name] = columns
+                    # add the sparse presence markers and discover their columns
+                    if sparse_ctx is not None:
+                        partial_table = self._apply_sparse_markers(
+                            table_name, row, columns, sparse_ctx, ident_path, partial_table
+                        )
+                        if partial_table:
+                            # marker columns are new: persist them in the schema
+                            schema.update_table(partial_table, normalize_identifiers=False)
+                            schema_update.setdefault(table_name, []).append(partial_table)
+                            column_schemas[table_name] = schema.get_table_columns(table_name)
+                            columns = column_schemas[table_name]
+                        strip_sparse_context(row)
                     # store row
                     # TODO: store all rows for particular items all together after item is fully completed
                     #   will be useful if we implement bad data sending to a table
@@ -224,7 +255,11 @@ class JsonLItemsNormalizer(ItemsNormalizer):
         return schema_update
 
     def _coerce_row(
-        self, table_name: str, parent_table: str, row: StrAny
+        self,
+        table_name: str,
+        parent_table: str,
+        row: StrAny,
+        keep_nulls: bool = False,
     ) -> Tuple[DictStrAny, TPartialTableSchema]:
         """Fits values of fields present in `row` into a schema of `table_name`. Will coerce values into data types and infer new tables and column schemas.
 
@@ -232,7 +267,8 @@ class JsonLItemsNormalizer(ItemsNormalizer):
         * if table schema for `table_name` does not exist, new table is created
         * if column schema for a field in `row` does not exist, it is inferred from data
         * if incomplete column schema (no data type) exists, column is inferred from data and existing hints are applied
-        * fields with None value are removed
+        * fields with None value are removed, unless `keep_nulls` is set (sparse update merge),
+          where an explicit None must reach the staged row to clear the destination field
 
         Returns tuple with row with coerced values and a partial table containing just the newly added columns or None if no changes were detected
         """
@@ -249,11 +285,26 @@ class JsonLItemsNormalizer(ItemsNormalizer):
         coerce_type = self._coerce_type
         tz_override = self._timezone_override
         for col_name, v in row.items():
+            # the private sparse marker keys are handled outside of coercion
+            if col_name in (SPARSE_PRESENCE_KEY, SPARSE_SEQ_KEY, SPARSE_LIST_PATHS_KEY):
+                new_row[col_name] = v
+                continue
             # skip None values, we should infer the types later
             if v is None:
                 # just check if column is nullable if it exists
                 new_col_def = self._coerce_null_value(table_columns, table_name, col_name)
                 new_col_name = col_name
+                if keep_nulls:
+                    # explicit null is a value in a sparse patch: keep it so the loader can clear
+                    # the destination field. A column never seen with a value still needs a
+                    # concrete type to be materialized in the staged table, so default a brand new
+                    # nullable column to text (a SQL NULL fits any nullable column) and let later
+                    # non-null patches migrate it to the real type
+                    if new_col_def is None and col_name not in table_columns:
+                        new_col_def = self._infer_column(
+                            col_name, None, data_type="text", table_name=table_name
+                        )
+                    new_row[col_name] = None
             else:
                 # fast path: known column with matching type
                 if existing_column := table_columns.get(col_name):
@@ -300,6 +351,88 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                 updated_table_partial["columns"][new_col_name] = new_col_def
 
         return new_row, updated_table_partial
+
+    def _new_marker_partial(
+        self,
+        table_name: str,
+        parent_table: str,
+        marker_columns: Dict[str, TColumnSchema],
+    ) -> TPartialTableSchema:
+        """Creates a partial table that only adds sparse marker columns."""
+        table = self.schema._schema_tables.get(table_name)
+        partial = copy(table) if table else utils.new_table(table_name, parent_table)
+        partial["columns"] = {}
+        for name, col in marker_columns.items():
+            partial["columns"][name] = col
+        return partial
+
+    def _apply_sparse_markers(
+        self,
+        table_name: str,
+        row: DictStrAny,
+        columns: TTableSchemaColumns,
+        sparse_ctx: Dict[str, Any],
+        ident_path: Tuple[str, ...],
+        data_partial: TPartialTableSchema,
+    ) -> TPartialTableSchema:
+        """Adds the sparse update marker columns to a staged row and returns a partial table with
+        any marker columns that are new to the schema (or `None` when all markers exist).
+
+        Root rows get one boolean presence mask per present data column plus the patch sequence.
+        Nested rows of an explicitly provided list get the list marker.
+        """
+        table = self.schema._schema_tables.get(table_name)
+        parent_table = table.get("parent") if table else None
+        new_markers: Dict[str, TColumnSchema] = {}
+        existing = (table["columns"] if table else {}) or {}
+        is_root = not parent_table
+
+        def _require(col: TColumnSchema) -> None:
+            if col["name"] not in existing and col["name"] not in new_markers:
+                new_markers[col["name"]] = col
+
+        if is_root:
+            # one mask per data column the patch explicitly contains; dlt system columns are not
+            # masked because the loader always recreates them
+            presence: Set[str] = sparse_ctx[SPARSE_PRESENCE_KEY]
+            for col_name in presence:
+                if col_name in row or col_name in columns:
+                    mask_name = mask_column_name(col_name)
+                    row[mask_name] = True
+                    _require(make_mask_column(col_name))
+            # masks of columns absent from this patch stay out of the row (null in staging),
+            # which the loader reads as "keep the destination value"
+
+            # a root marker per nested list the patch provides, so an explicitly empty list
+            # (which emits no nested rows and cannot carry the per-row marker) still clears the
+            # destination list items. The marker is named after the nested table materializing
+            # the list path.
+            for list_path in sparse_ctx[SPARSE_LIST_PATHS_KEY]:
+                nested_table_name = self._shorten_fragments(table_name, *list_path)
+                marker = make_list_path_marker_column(nested_table_name)
+                row[marker["name"]] = True
+                _require(marker)
+
+            seq_col = make_seq_column()
+            if seq_col["name"] not in existing and seq_col["name"] not in new_markers:
+                new_markers[seq_col["name"]] = seq_col
+            row[C_SPARSE_SEQ] = sparse_ctx[SPARSE_SEQ_KEY]
+        else:
+            # nested rows belong to an explicitly provided list when their ident path is in the
+            # patch metadata; the marker scopes the "replace list items" merge to those lists
+            list_paths: Set[Tuple[str, ...]] = sparse_ctx[SPARSE_LIST_PATHS_KEY]
+            if ident_path in list_paths:
+                marker_col = make_list_marker_column()
+                _require(marker_col)
+                row[C_SPARSE_LIST] = True
+
+        if not new_markers:
+            return None
+        marker_partial = self._new_marker_partial(table_name, parent_table, new_markers)
+        if data_partial is not None:
+            # merge data and marker columns into one partial table update
+            marker_partial["columns"].update(data_partial["columns"])
+        return marker_partial
 
     def _infer_column(
         self,

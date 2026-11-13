@@ -205,6 +205,11 @@ class DestinationCapabilitiesContext(ContainerInjectableContext):
     supported_replace_strategies: Sequence[TLoaderReplaceStrategy] = None
     replace_strategies_selector: ReplaceStrategySelector = None
 
+    supports_sparse_update: bool = True
+    """Destination can apply sparse (partial patch) upserts, which require DELETE statements
+    inside the merge and temporary tables. Destinations whose MERGE cannot delete (e.g. ducklake)
+    disable this."""
+
     max_parallel_load_jobs: Optional[int] = None
     """The destination can set the maximum amount of parallel load jobs being executed"""
     loader_parallelism_strategy: Optional[TLoaderParallelismStrategy] = None

@@ -109,3 +109,26 @@ def test_normalize_empty_arrow_input_parquet_output(
     assert all(pyarrow.parquet.read_table(storage.make_full_path(f)).num_rows == 0 for f in files)
     step_info = raw_normalize.get_step_info(MockPipeline("arrow_parquet_pipeline", True))  # type: ignore[abstract]
     assert step_info.metrics[load_id][0]["table_metrics"]["items"].items_count == 0
+
+
+def test_arrow_normalizer_rejects_sparse_update(
+    parquet_caps: DestinationCapabilitiesContext, raw_normalize: Normalize
+) -> None:
+    """The columnar normalizer cannot tell an omitted field from a null one, so it must refuse a
+    sparse update table instead of silently merging full rows."""
+    from dlt.common.destination.sparse import SPARSE_UPDATE_HINT
+    from dlt.normalize.exceptions import NormalizeException
+
+    schema = Schema("arrow_sparse")
+    table = new_table(
+        "items",
+        write_disposition="merge",
+        columns=[{"name": "id", "data_type": "bigint", "nullable": False}],
+    )
+    table[SPARSE_UPDATE_HINT] = True
+    schema.update_table(table)
+
+    arrow_table = pyarrow.table({"id": pyarrow.array([1], type=pyarrow.int64())})
+    extract_arrow_items(raw_normalize.normalize_storage, arrow_table, schema, "items")
+    with pytest.raises(NormalizeException, match="Sparse update merge is not supported"):
+        normalize_pending(raw_normalize)

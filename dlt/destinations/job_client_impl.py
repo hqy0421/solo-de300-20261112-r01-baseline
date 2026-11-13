@@ -29,6 +29,7 @@ from dlt.common import logger
 from dlt.common.time import ensure_datetime_in_tz
 from dlt.common.destination.capabilities import DataTypeMapper
 from dlt.common.destination.exceptions import WriteDispositionNotSupported
+from dlt.common.destination.sparse import is_sparse_system_column
 from dlt.common.destination.utils import resolve_replace_strategy
 from dlt.common.json import json
 from dlt.common.schema.typing import (
@@ -854,6 +855,10 @@ WHERE """
             storage_columns,
             case_sensitive=self.capabilities.generates_case_sensitive_identifiers(),
         )
+        # sparse marker columns only exist in the staging dataset; the destination table keeps the
+        # user-facing data columns only (the markers are read to compose merged rows, never stored)
+        if not getattr(self, "in_staging_dataset_mode", False):
+            updates = [c for c in updates if not is_sparse_system_column(c["name"])]
         logger.info(f"Found {len(updates)} updates for {table_name} in {self.schema.name}")
         return updates
 
