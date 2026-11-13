@@ -122,6 +122,52 @@ class PipelineStateEngineNoUpgradePathException(PipelineException):
         )
 
 
+class PipelineStateLeaseException(PipelineException):
+    """Base class for state lease exceptions"""
+
+
+class PipelineStateLeaseLost(PipelineStateLeaseException):
+    """Raised when a pipeline instance lost its state lease and must stop.
+
+    The lease is lost when it was taken over by a newer pipeline instance (a higher run
+    generation) sharing the same working directory or when the lease file disappeared.
+    All state writes of the fenced instance are rejected so it cannot overwrite newer
+    state (ie. move incremental cursors back).
+    """
+
+    def __init__(
+        self,
+        pipeline_name: str,
+        instance_id: str,
+        generation: int,
+        reason: str,
+    ) -> None:
+        self.instance_id = instance_id
+        self.generation = generation
+        self.reason = reason
+        msg = (
+            f"Pipeline instance `{instance_id}` lost the state lease for run generation"
+            f" `{generation}`: {reason}. The instance is fenced and its state writes are"
+            " rejected so it cannot overwrite newer state. Stop this instance or"
+            " re-initialize it to acquire a new lease generation."
+        )
+        super().__init__(pipeline_name, msg)
+
+
+class PipelineStateGenerationFenced(PipelineStateLeaseException):
+    """Raised when a state write carries a run generation that is not newer than the stored one"""
+
+    def __init__(self, pipeline_name: str, generation: int, stored_generation: int) -> None:
+        self.generation = generation
+        self.stored_generation = stored_generation
+        msg = (
+            f"Run generation `{generation}` is not newer than the stored generation"
+            f" `{stored_generation}`. A newer pipeline instance already owns the state and"
+            " this instance may not write it back."
+        )
+        super().__init__(pipeline_name, msg)
+
+
 class PipelineHasPendingDataException(PipelineException):
     def __init__(self, pipeline_name: str, pipelines_dir: str) -> None:
         from dlt._workspace.cli.echo import cli_cmd

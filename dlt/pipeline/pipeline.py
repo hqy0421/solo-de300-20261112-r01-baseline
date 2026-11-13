@@ -48,7 +48,14 @@ from dlt.common.schema.typing import (
 )
 from dlt.common.schema.utils import normalize_schema_name
 from dlt.common.storages.exceptions import LoadPackageNotFound
-from dlt.common.typing import ConfigValue, TFun, TSecretStrValue, TColumnNames, get_type_hints
+from dlt.common.typing import (
+    ConfigValue,
+    DictStrAny,
+    TFun,
+    TSecretStrValue,
+    TColumnNames,
+    get_type_hints,
+)
 from dlt.common.runners import pool_runner as runner
 from dlt.common.storages import (
     LiveSchemaStorage,
@@ -97,7 +104,7 @@ from dlt.common.pipeline import (
     TRefreshMode,
 )
 from dlt.common.schema import Schema
-from dlt.common.utils import digest256, is_interactive, simple_repr, without_none
+from dlt.common.utils import digest256, is_interactive, simple_repr, uniq_id, without_none
 from dlt.common.warnings import deprecated, Dlt04DeprecationWarning, DltDeprecationWarning
 from dlt.common.versioned_state import (
     json_encode_state,
@@ -150,13 +157,13 @@ from dlt.pipeline.state_sync import (
     state_resource,
     default_pipeline_state,
 )
+from dlt.pipeline.state_lease import StateLeaseStore
 from dlt.pipeline.abort import prepare_abort_packages, execute_abort_plan, TAbortPlan
 from dlt.common.storages.load_package import (
     TLoadPackageState,
     TPackageJobState,
 )
 from dlt.pipeline.helpers import prepare_refresh_source
-
 
 TWithLocalFiles = TypeVar("TWithLocalFiles", bound=WithLocalFiles)
 
@@ -364,9 +371,12 @@ class Pipeline(SupportsPipeline):
         self._last_trace: PipelineTrace = None
         self._state_restored: bool = False
         self._dataset_access_tracked: bool = False
+        self._state_lease_store: Optional[StateLeaseStore] = None
 
         # initialize pipeline working dir
         self._init_working_dir(pipeline_name, pipelines_dir)
+        # acquire the optional state lease before any state is read or written
+        self._acquire_state_lease()
 
         with self.managed_state() as state:
             self._configure(
@@ -472,6 +482,7 @@ class Pipeline(SupportsPipeline):
             self._normalize_storage_config(),
             self.collector,
             original_data=data,
+            extract_guard=self._state_lease_guard(),
         )
         try:
             with self._maybe_destination_capabilities():
@@ -1548,6 +1559,32 @@ class Pipeline(SupportsPipeline):
         if self.dev_mode:
             self._wipe_working_folder()
 
+    def _acquire_state_lease(self) -> None:
+        """Acquires the optional state lease for this instance. No-op when the lease is disabled.
+
+        Called on init and re-called after the working folder is wiped while this
+        instance exists (the wipe also removes the lease file).
+        """
+        lease_config = self.config.state_lease if self.config else None
+        if lease_config is None or not lease_config.enabled:
+            return
+        if self._state_lease_store is None:
+            self._state_lease_store = StateLeaseStore(
+                self.working_dir,
+                self.pipeline_name,
+                instance_id=lease_config.instance_id
+                or f"{self._pipeline_instance_id}_{uniq_id(4)}",
+                lease_ttl_seconds=lease_config.lease_ttl_seconds,
+                generation=lease_config.generation,
+            )
+        self._state_lease_store.acquire()
+
+    def _state_lease_guard(self) -> Optional[Callable[[], None]]:
+        """A throttled lease check that stops extraction when the state lease is lost"""
+        if self._state_lease_store is None:
+            return None
+        return self._state_lease_store.extract_guard()
+
     def _configure(
         self,
         import_schema_path: str,
@@ -1596,6 +1633,8 @@ class Pipeline(SupportsPipeline):
         else:
             # this will erase the existing working folder
             self._create_pipeline()
+            # the wipe also removed the state lease: acquire it again for this instance
+            self._acquire_state_lease()
 
         # persist current dev_mode for future transition detection
         if managed_state is not None and not attach_pipeline:
@@ -1629,6 +1668,9 @@ class Pipeline(SupportsPipeline):
         load_package_state_update: Optional[TLoadPackageState] = None,
     ) -> str:
         load_package_state_update = copy(load_package_state_update or {})
+        if self._state_lease_store is not None:
+            # stop extraction early when the state lease was lost before the next source
+            self._state_lease_store.ensure_valid()
         # discover the existing pipeline schema
         try:
             # all live schemas are initially committed and during the extract will accumulate changes in memory
@@ -1926,7 +1968,15 @@ class Pipeline(SupportsPipeline):
 
     def _get_state(self) -> TPipelineState:
         try:
-            state = json_decode_state(self._pipeline_storage.load(Pipeline.STATE_FILE))
+            if self._state_lease_store is not None:
+                state = cast(DictStrAny, self._state_lease_store.load_state())
+                if state is None:
+                    # first run with the lease enabled: migrate the legacy single-file
+                    # state into the partitioned layout (the migration is audited)
+                    state = json_decode_state(self._pipeline_storage.load(Pipeline.STATE_FILE))
+                    self._state_lease_store.migrate_legacy_state(cast(TPipelineState, state))
+            else:
+                state = json_decode_state(self._pipeline_storage.load(Pipeline.STATE_FILE))
             migrated_state = migrate_state_to_current(self.pipeline_name, state)
             # TODO: move to a migration. this change is local and too small to justify
             # engine upgrade
@@ -2133,7 +2183,11 @@ class Pipeline(SupportsPipeline):
         _, hash_, _ = bump_pipeline_state_version_if_modified(self._props_to_state(state))
         should_extract = hash_ != state["_local"].get("_last_extracted_hash")
         if should_extract and extract_state:
-            extract_ = extract or Extract(self._schema_storage, self._normalize_storage_config())
+            extract_ = extract or Extract(
+                self._schema_storage,
+                self._normalize_storage_config(),
+                extract_guard=self._state_lease_guard(),
+            )
             # create or get load package upfront to get load_id to create state doc
             schema = schema or self.default_schema
             # note that we preferably retrieve existing package for `schema`
@@ -2180,6 +2234,11 @@ class Pipeline(SupportsPipeline):
         package_storage.save_pipeline_state(load_id, state_blob, schema_blobs)
 
     def _save_state(self, state: TPipelineState) -> None:
+        if self._state_lease_store is not None:
+            # fenced write into the generation/source partitions: raises when the lease
+            # was lost so a stale instance can never overwrite newer state. the legacy
+            # state.json below is kept as a compatibility view written by the lease holder
+            self._state_lease_store.save_state(state)
         self._pipeline_storage.save(Pipeline.STATE_FILE, json_encode_state(state))
 
     def __getstate__(self) -> Any:

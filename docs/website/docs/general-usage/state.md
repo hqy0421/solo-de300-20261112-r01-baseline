@@ -162,3 +162,29 @@ This will display the source and resource state slots for all known sources.
 
 - Use the `dlt pipeline <pipeline_name> drop <resource_name>` command to [drop the state and tables for a given resource](../reference/command-line-interface.md#dlt-pipeline-drop).
 - Use the `dlt pipeline <pipeline_name> drop --state-paths` command to [reset the state at a given path without touching the tables and data](../reference/command-line-interface.md#dlt-pipeline-drop).
+
+## Protect the state with a lease when instances share a working directory
+
+By default, the pipeline state lives in a single `state.json` file in the pipeline working directory. If two pipeline instances (for example, a stale container and its replacement) share the same working directory, they can overwrite each other's source state and move incremental cursors back. The optional **state lease** protects against that:
+
+- The state is stored in partitions per pipeline, source, and run generation under `<working_dir>/state/`.
+- An instance may persist state only while it holds the lease. A newer instance takes the lease over with a higher run generation, which **fences** the previous instance: its state writes are rejected with `PipelineStateLeaseLost` and its extraction stops, so it can never overwrite newer state.
+- Enabling the lease on a pipeline that already has a `state.json` migrates it into the partitioned layout once; the migration is recorded in an append-only audit log (`state/migrations.jsonl`) and the legacy file is kept in place.
+- The lease holder still writes the legacy `state.json` as a compatibility view, so tooling that reads it keeps working.
+
+The feature is opt-in and disabled by default: a single instance keeps using `state.json` exactly as before. Enable it via configuration, for example with environment variables:
+
+```sh
+PIPELINES__STATE_LEASE__ENABLED=true
+PIPELINES__STATE_LEASE__LEASE_TTL_SECONDS=300
+```
+
+or in `config.toml`:
+
+```toml
+[pipelines.state_lease]
+enabled = true
+lease_ttl_seconds = 300
+```
+
+You may also set `instance_id` (a unique id of this pipeline instance, auto-generated otherwise) and `generation` (an explicit run generation, which must be higher than the stored one) under the same config section. An unrenewed lease expires after `lease_ttl_seconds`, allowing another instance to take it over; the owning instance renews it automatically while it runs.

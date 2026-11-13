@@ -24,6 +24,18 @@ class PipelineRuntimeConfiguration(BaseConfiguration):
 
 
 @configspec
+class StateLeaseConfiguration(BaseConfiguration):
+    enabled: bool = False
+    """Enables the state lease and the source/run-generation partitioned state layout"""
+    lease_ttl_seconds: float = 300.0
+    """Time after which an unrenewed lease expires and may be taken over by another instance"""
+    instance_id: Optional[str] = None
+    """Unique id of this pipeline instance. Auto-generated when not set"""
+    generation: Optional[int] = None
+    """Explicit run generation. Must be higher than the stored generation. Auto-incremented when not set"""
+
+
+@configspec
 class PipelineConfiguration(BaseConfiguration):
     pipeline_name: Optional[str] = None
     pipelines_dir: Optional[str] = None
@@ -55,6 +67,16 @@ class PipelineConfiguration(BaseConfiguration):
     runtime: PipelineRuntimeConfiguration = None
     refresh: Optional[TRefreshMode] = None
     """Refresh mode for the pipeline to fully or partially reset a source during run. See docstring of `dlt.pipeline` for more details."""
+    state_lease: StateLeaseConfiguration = None
+    """Optional state lease and source isolation for pipeline instances that share a working directory.
+
+    When enabled, the pipeline state is stored in partitions per pipeline, source and run
+    generation and only the instance holding the lease may persist it. A newer instance
+    takes the lease over (higher run generation) which fences the previous instance: its
+    state writes are rejected and its extraction stops so a stale instance cannot move
+    incremental cursors back. Disabled by default: a single instance keeps using the
+    single `state.json` file exactly as before.
+    """
 
     def on_resolved(self) -> None:
         # generate pipeline name from the entry point script name

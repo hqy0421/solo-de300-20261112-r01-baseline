@@ -1,7 +1,7 @@
 import contextlib
 from collections.abc import Sequence as C_Sequence
 from copy import copy
-from typing import Iterator, List, Dict, Any, Mapping, Optional, Tuple, cast
+from typing import Iterator, List, Callable, Dict, Any, Mapping, Optional, Tuple, cast
 import yaml
 
 from dlt.common import logger
@@ -383,6 +383,7 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         normalize_storage_config: NormalizeStorageConfiguration,
         collector: Collector = NULL_COLLECTOR,
         original_data: Any = None,
+        extract_guard: Optional[Callable[[], None]] = None,
     ) -> None:
         """optionally saves originally extracted `original_data` to generate extract info"""
         self.collector = collector
@@ -390,6 +391,8 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
         self.extract_storage = ExtractStorage(normalize_storage_config)
         # TODO: this should be passed together with DltSource to extract()
         self.original_data: Any = original_data
+        # an optional check (ie. the state lease) that aborts extraction when it raises
+        self.extract_guard = extract_guard
         super().__init__()
 
     def _compute_metrics(self, load_id: str, source: DltSource) -> ExtractMetrics:
@@ -610,6 +613,9 @@ class Extract(WithStepInfo[ExtractMetrics, ExtractInfo]):
 
                         # kill extraction if signalled
                         signals.raise_if_signalled()
+                        # abort extraction if the state lease was lost (when lease enabled)
+                        if self.extract_guard is not None:
+                            self.extract_guard()
 
                         resource = source.resources.with_pipe(pipe_item.pipe)
                         item_format = get_data_item_format(pipe_item.item)
