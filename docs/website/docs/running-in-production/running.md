@@ -650,6 +650,23 @@ Here's what you can do to deal with partially loaded packages:
 
 :::
 
+### Per-table commit log
+
+If the process may be killed while the `load` step writes to the destination (spot instances, OOM kills, `SIGKILL`), you can enable an optional commit log that records the progress of each table of a load package:
+
+```toml
+[load]
+commit_log_enabled=true
+```
+
+For every table, the log records `prepared` (jobs started, with a SHA-256 fingerprint of the input files), `executed` (all jobs committed at the destination) and `confirmed` (all jobs durably completed) — or `failed` with the terminal error. When a load is interrupted and the pipeline runs again, the log is verified before the package resumes:
+
+- `confirmed` tables are checked for completeness and are not re-executed.
+- Unconfirmed (`prepared`/`executed`) tables have only their uncommitted jobs re-queued, so just the uncertain tables are redone. The input fingerprints of pending jobs are re-checked, and a mismatch (for example, a package restored from a different input) fails the load with `LoadPackageInconsistent` instead of silently loading wrong data.
+- Right before the destination commits the load id, the final per-table state is recorded together with a hash of the pipeline state (the source position) committed under the same load id, so the committed package and the visible source position always correspond to each other.
+
+The log is stored in a `.commit_log` folder inside the load package and is archived with it. Logs of completed packages are pruned after `commit_log_retention_days` (default 14); before a log is deleted, a traceable summary (final table statuses, fingerprints, schema and state hashes) is written to `commit_log_archive/<load_id>.json` in the load volume. The default is `commit_log_enabled=false`, which changes nothing about how packages are loaded.
+
 ### What `run` does inside
 
 Before adding retry to pipeline steps, note how the `run` method actually works:

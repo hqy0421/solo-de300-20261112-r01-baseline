@@ -27,6 +27,14 @@ class LoaderConfiguration(PoolRunnerConfiguration):
     """If set to False: will attempt to drain load pool on signal, if True: will continue loading new job"""
     auto_abort_on_terminal_error: bool = False
     """If True, a terminal job failure aborts the package like `Pipeline.abort_packages`: pending packages are deleted and pipeline state is restored"""
+    commit_log_enabled: bool = False
+    """Enables the per-table commit log for load packages: records prepare/execute/confirm
+    events with input fingerprints per table, verifies them on restart and re-executes only
+    unconfirmed tables. The final package record binds the committed load id to the pipeline
+    state (source position). Disabled keeps the default load behavior unchanged."""
+    commit_log_retention_days: Optional[float] = 14.0
+    """Days to keep commit logs of completed packages. Expired logs are deleted only after a
+    traceable summary is archived in `commit_log_archive`. None keeps the logs forever."""
 
     def on_resolved(self) -> None:
         self.pool_type = (

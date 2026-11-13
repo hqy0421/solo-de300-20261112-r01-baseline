@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 from functools import reduce
 from threading import BoundedSemaphore
 from typing import Dict, List, NoReturn, Optional, Set, Tuple, Iterator, Sequence
@@ -20,9 +21,17 @@ from dlt.common.storages.load_storage import (
 from dlt.common.storages.load_package import (
     LoadPackageStateInjectableContext,
     TLoadPackageStatus,
+    TPackageJobState,
     commit_load_package_state,
     load_package_state as current_load_package,
 )
+from dlt.common.storages.load_commit_log import (
+    TableCommitLog,
+    fingerprint_file,
+    fingerprint_job_files,
+    prune_expired_commit_logs,
+)
+from dlt.common.storages.exceptions import LoadPackageInconsistent
 from dlt.common.runners import TRunMetrics, Runnable, workermethod, NullExecutor
 from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
 from dlt.common.logger import pretty_format_exception
@@ -97,6 +106,8 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
         self.load_storage: LoadStorage = self.create_storage(is_storage_owner)
         self._loaded_packages: List[LoadPackageInfo] = []
         self._job_metrics: Dict[str, LoadJobMetrics] = {}
+        # optional per-table commit log of the package being loaded, None when disabled
+        self._commit_log: Optional[TableCommitLog] = None
         # job completed signalling event (start blocking)
         self._done_event = BoundedSemaphore()
         self._done_event.acquire()
@@ -218,13 +229,17 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
             if isinstance(job, RunnableLoadJob):
                 _packages = self.load_storage.normalized_packages
                 _file_name = job.file_name()
+                _table_name = job_info.table_name
+
+                def _on_completed(state: TLoadJobState, msg: Optional[str]) -> None:
+                    _packages.save_pending_transition(load_id, _file_name, state, msg)
+                    self._commit_log_job_executed(load_id, _table_name)
+
                 job.set_run_vars(
                     load_id=load_id,
                     schema=schema,
                     load_table=load_table,
-                    on_completed=lambda state, msg: _packages.save_pending_transition(
-                        load_id, _file_name, state, msg
-                    ),
+                    on_completed=_on_completed,
                 )
                 # set closed job client: note that it will be replaced
                 # by a client created in the worker thread after submit
@@ -325,6 +340,9 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
         )
 
         logger.info(f"Will load additional {len(load_files)}, creating jobs")
+        if self._commit_log is not None and load_files:
+            # fingerprint the input files before the jobs move them to started_jobs
+            self._commit_log_record_prepared(load_files)
         started_jobs: List[LoadJob] = []
         for file in load_files:
             job = self.submit_job(file, load_id, schema)
@@ -564,6 +582,9 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
                 self.load_storage.normalized_packages.clear_pending_transition(
                     load_id, job.file_name()
                 )
+                self._commit_log_table_failed(
+                    load_id, job.job_file_info().table_name, failed_message
+                )
                 finalized_jobs.append(job)
             elif state == "retry":
                 # try to get exception message from job
@@ -602,6 +623,7 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
                 self.load_storage.normalized_packages.clear_pending_transition(
                     load_id, job.file_name()
                 )
+                self._commit_log_table_confirmed(load_id, job.job_file_info().table_name)
                 logger.info(f"Job for {job.job_id()} completed in load {load_id}")
                 finalized_jobs.append(job)
             else:
@@ -640,6 +662,9 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
     def complete_package(self, load_id: str, schema: Schema, aborted: bool = False) -> None:
         # do not commit load id for aborted packages
         if not aborted:
+            if self._commit_log is not None:
+                # bind the final per-table state to the source position before the commit
+                self._commit_log_record_commit_ready(load_id, schema)
             with self.get_destination_client(schema) as job_client:
                 with Container().injectable_context(
                     LoadPackageStateInjectableContext(
@@ -649,6 +674,11 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
                 ):
                     job_client.complete_load(load_id)
                     self._maybe_truncate_staging_dataset(schema, job_client)
+            if self._commit_log is not None:
+                try:
+                    self._commit_log.record_package_committed()
+                except Exception as ex:
+                    logger.warning(f"commit log: could not record package commit: {ex}")
 
         self.load_storage.complete_load_package(load_id, aborted)
         self.gather_metrics(load_id, schema, "aborted" if aborted else "loaded")
@@ -754,6 +784,13 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
         if self.load_storage.normalized_packages.has_abort_flag(load_id):
             # aborts package - always raises
             self._raise_package_abort(load_id, schema)
+        if self.config.commit_log_enabled:
+            # create the commit log lazily so any entry point loading a package is covered
+            if self._commit_log is None or self._commit_log.load_id != load_id:
+                self._commit_log = TableCommitLog(self.load_storage.normalized_packages, load_id)
+            # a previous run may have been interrupted mid-load: verify the commit log,
+            # keep confirmed tables and re-queue uncommitted jobs of unconfirmed tables
+            self._verify_commit_log(load_id)
         new_jobs = self.get_new_jobs_info(load_id)
         self.init_jobs_counter(load_id)
         running_jobs = self.initialize_package(load_id, schema, new_jobs)
@@ -872,11 +909,237 @@ class Load(Runnable[Executor], WithStepInfo[LoadMetrics, LoadInfo]):
         logger.info(f"Package {load_id} aborted successfully")
         raise LoadPackageAborted(load_id, job_exception)
 
+    #
+    # commit log (optional per-table commit journal, see `LoaderConfiguration.commit_log_enabled`)
+    #
+
+    def _commit_log_record_prepared(self, load_files: Sequence[str]) -> None:
+        """Records `prepared` with input fingerprints for jobs about to be started.
+
+        Jobs already covered by a `prepared` event (eg. re-queued after a restart) are
+        skipped. Must be called before the job files leave `new_jobs`. Commit log writes
+        are best-effort and never fail the load.
+        """
+        assert self._commit_log is not None
+        try:
+            known_job_ids = self._commit_log.prepared_job_ids()
+            packages = self.load_storage.normalized_packages
+            by_table: Dict[str, List[str]] = {}
+            for rel_path in load_files:
+                parsed = ParsedLoadJobFileName.parse(rel_path)
+                if parsed.job_id() in known_job_ids:
+                    continue
+                by_table.setdefault(parsed.table_name, []).append(
+                    packages.storage.make_full_path(rel_path)
+                )
+            for table_name, full_paths in by_table.items():
+                self._commit_log.record_prepared(table_name, fingerprint_job_files(full_paths))
+        except Exception as ex:
+            logger.warning(f"commit log: could not record prepared jobs: {ex}")
+
+    def _commit_log_job_executed(self, load_id: str, table_name: str) -> None:
+        """Runs in the worker thread after a job committed at the destination. Records
+        `executed` for the table when all its jobs reached a terminal state there."""
+        if self._commit_log is None:
+            return
+        try:
+            packages = self.load_storage.normalized_packages
+            table_jobs = packages.list_job_with_states_for_table(load_id, table_name)
+            for job_state, parsed in table_jobs:
+                if job_state == "completed_jobs":
+                    continue
+                if job_state == "started_jobs" and packages.load_pending_transition(
+                    load_id, parsed.file_name()
+                ) is not None:
+                    continue
+                # a job is still new or executing: the table is not executed yet
+                return
+            self._commit_log.record_executed(
+                table_name, [parsed.job_id() for _, parsed in table_jobs]
+            )
+        except Exception as ex:
+            logger.warning(f"commit log: could not record executed for {table_name}: {ex}")
+
+    def _commit_log_table_confirmed(self, load_id: str, table_name: str) -> None:
+        """Records `confirmed` when all jobs of the table are durably completed."""
+        if self._commit_log is None:
+            return
+        try:
+            packages = self.load_storage.normalized_packages
+            table_jobs = packages.list_job_with_states_for_table(load_id, table_name)
+            if table_jobs and all(job_state == "completed_jobs" for job_state, _ in table_jobs):
+                self._commit_log.record_confirmed(
+                    table_name, [parsed.job_id() for _, parsed in table_jobs]
+                )
+        except Exception as ex:
+            logger.warning(f"commit log: could not record confirmed for {table_name}: {ex}")
+
+    def _commit_log_table_failed(
+        self, load_id: str, table_name: str, failed_message: Optional[str]
+    ) -> None:
+        """Records `failed` for a table with a terminally failed job."""
+        if self._commit_log is None:
+            return
+        try:
+            packages = self.load_storage.normalized_packages
+            table_jobs = packages.list_job_with_states_for_table(load_id, table_name)
+            self._commit_log.record_failed(
+                table_name,
+                [parsed.job_id() for _, parsed in table_jobs],
+                failed_message,
+            )
+        except Exception as ex:
+            logger.warning(f"commit log: could not record failed for {table_name}: {ex}")
+
+    def _commit_log_record_commit_ready(self, load_id: str, schema: Schema) -> None:
+        """Records the final per-table state of the package bound to the pipeline state
+        (source position) committed with the same load id. Called right before the
+        destination commits the load id."""
+        assert self._commit_log is not None
+        try:
+            package_state = self.load_storage.normalized_packages.get_load_package_state(load_id)
+            state_doc = package_state.get("pipeline_state")
+            state_hash: Optional[str] = None
+            if state_doc and state_doc.get("state"):
+                state_hash = (
+                    "sha256:"
+                    + hashlib.sha256(state_doc["state"].encode("utf-8")).hexdigest()
+                )
+            tables = {
+                table_name: event["event"]
+                for table_name, event in self._commit_log.table_statuses().items()
+            }
+            not_confirmed = {
+                table_name: status
+                for table_name, status in tables.items()
+                if status != "confirmed"
+            }
+            if not_confirmed:
+                logger.warning(
+                    f"commit log: package {load_id} commits with tables not confirmed:"
+                    f" {not_confirmed}"
+                )
+            self._commit_log.record_package_commit_ready(
+                state_hash, schema.name, schema.version_hash, tables
+            )
+        except Exception as ex:
+            logger.warning(f"commit log: could not record package commit ready: {ex}")
+
+    def _verify_commit_log(self, load_id: str) -> None:
+        """Verifies the commit log of a package that may have been interrupted mid-load.
+
+        * `confirmed` tables must have all recorded jobs in `completed_jobs` - they are
+          kept and not re-executed
+        * `prepared`/`executed` (unconfirmed) tables get their started jobs that never
+          committed at the destination re-queued, so only uncertain tables are redone
+        * input fingerprints of pending jobs are re-checked against the `prepared`
+          records to detect a package restored from a different input
+
+        Raises `LoadPackageInconsistent` when the log contradicts the package on disk.
+        """
+        assert self._commit_log is not None
+        packages = self.load_storage.normalized_packages
+        statuses = self._commit_log.table_statuses()
+        if not statuses:
+            return
+        logger.info(
+            f"commit log: verifying {len(statuses)} recorded tables of package {load_id}"
+        )
+        # map table -> job id -> (folder state, parsed file name)
+        tables: Dict[str, Dict[str, Tuple[TPackageJobState, ParsedLoadJobFileName]]] = {}
+        for job_state, parsed in packages.list_all_jobs_with_states(load_id):
+            tables.setdefault(parsed.table_name, {})[parsed.job_id()] = (job_state, parsed)
+
+        requeued_count = 0
+        for table_name, last_event in statuses.items():
+            table_jobs = tables.get(table_name, {})
+            if last_event["event"] == "confirmed":
+                missing = [
+                    job_id
+                    for job_id in last_event.get("jobs", [])
+                    if job_id not in table_jobs
+                    or table_jobs[job_id][0] != "completed_jobs"
+                ]
+                if missing:
+                    raise LoadPackageInconsistent(
+                        load_id,
+                        f"commit log: table {table_name} is confirmed but jobs {missing} are"
+                        " not in completed_jobs",
+                    )
+            elif last_event["event"] in ("prepared", "executed"):
+                # re-check the input fingerprints of jobs that are not done yet
+                for batch in self._commit_log.prepared_batches(table_name):
+                    for job_id, fingerprint in batch.get("job_fingerprints", {}).items():
+                        found = table_jobs.get(job_id)
+                        if found is None:
+                            raise LoadPackageInconsistent(
+                                load_id,
+                                f"commit log: prepared job {job_id} of table {table_name} is"
+                                " missing from the package",
+                            )
+                        job_state, parsed = found
+                        if job_state in ("completed_jobs", "failed_jobs"):
+                            continue
+                        full_path = packages.storage.make_full_path(
+                            packages.get_job_file_path(load_id, job_state, parsed.file_name())
+                        )
+                        actual = fingerprint_file(full_path)
+                        if actual != fingerprint:
+                            raise LoadPackageInconsistent(
+                                load_id,
+                                f"commit log: input fingerprint mismatch for job {job_id} of"
+                                f" table {table_name}: expected {fingerprint}, got {actual}",
+                            )
+                # re-queue started jobs that never committed at the destination
+                for job_id, (job_state, parsed) in table_jobs.items():
+                    if job_state == "started_jobs" and packages.load_pending_transition(
+                        load_id, parsed.file_name()
+                    ) is None:
+                        packages.retry_job(
+                            load_id,
+                            parsed.file_name(),
+                            "commit log: table not confirmed, re-executing uncommitted job"
+                            " after restart",
+                            "transient",
+                        )
+                        requeued_count += 1
+            # failed tables are left to the regular failure handling
+        if requeued_count:
+            logger.warning(
+                f"commit log: re-queued {requeued_count} uncommitted jobs of unconfirmed"
+                f" tables in package {load_id}"
+            )
+        if self._commit_log.package_status() == "package_commit_ready":
+            logger.warning(
+                f"commit log: package {load_id} was recorded commit-ready but not committed:"
+                " the process stopped around the destination commit. The load id will be"
+                " committed again and may appear twice in the loads table."
+            )
+
+    def _prune_commit_logs(self) -> None:
+        """Archives summaries and deletes commit logs of completed packages older than
+        `commit_log_retention_days`."""
+        retention_days = self.config.commit_log_retention_days
+        if retention_days is None:
+            return
+        try:
+            archived = prune_expired_commit_logs(self.load_storage, retention_days)
+            if archived:
+                logger.info(
+                    f"commit log: archived summaries and pruned logs of {len(archived)}"
+                    f" packages: {archived}"
+                )
+        except Exception as ex:
+            logger.warning(f"commit log: pruning failed: {ex}")
+
     def run(self, pool: Optional[Executor]) -> TRunMetrics:
         # store pool
         self.pool = pool or NullExecutor()
 
         logger.info("Running file loading")
+        if self.config.commit_log_enabled:
+            # prune expired commit logs of completed packages (summaries are archived first)
+            self._prune_commit_logs()
         # get list of loads and order by name ASC to execute schema updates
         loads = self.load_storage.list_normalized_packages()
         logger.info(f"Found {len(loads)} load packages")
