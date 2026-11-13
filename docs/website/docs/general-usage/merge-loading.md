@@ -1218,3 +1218,82 @@ This source filter is useful when the staging tables keep the records of earlier
 The names of `extra_placeholders` cannot be `table`, `staging_table` or the name of a value placeholder that dlt fills. dlt reads `extra_placeholders` only from a write disposition dict, not from a function that returns the write disposition.
 
 A table [variant](resource.md#dispatch-data-to-many-tables) and a nested table with its own `primary_key` or `merge_key` in [`nested_hints`](schema.md#generate-custom-linking-for-nested-tables) merge on their own. dlt takes their values from their own write disposition. A variant without a write disposition uses the one of the resource.
+
+## Delete policy (soft and hard deletes)
+
+Source systems typically represent an invalidated customer in two ways:
+
+1. a **delete marker** (a tombstone flag or timestamp) on a row that is still delivered, and
+2. the **physical absence** of a row from a data package.
+
+The optional `delete_policy` of a merge resource classifies records into:
+
+- **retained** — active history,
+- **soft-deleted** — the row is kept and a destination flag column is set,
+- **hard-deleted** — the row is physically removed,
+- **undetermined** — the row is left untouched.
+
+The policy is **disabled by default**: without configuration nothing is ever classified as a
+delete. It works with the `delete-insert`, `upsert` and `cdc` merge strategies (not `scd2`,
+which preserves retired versions by design).
+
+### Configuration
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `delete_marker_column` | — | Source column whose truthy value marks a row as deleted. |
+| `marker_action` | `soft_delete` | Action for marker-flagged rows: `soft_delete` or `hard_delete`. |
+| `sync_scope` | `present_only` | `present_only` judges only delivered rows; `full_sync` declares the package complete, so absent records are deleted. |
+| `absent_action` | `hard_delete` | Action for previously seen rows absent from a `full_sync` package. |
+| `soft_delete_column_name` | — | Destination column storing the soft-delete flag. Required when a soft delete is reachable. |
+| `row_version_column_name` | — | Optional version column preventing late data from reviving a confirmed delete. |
+
+### Example: soft delete via marker, hard delete on full sync
+
+```py
+from dlt.common.deletes import DeletePolicy, DeleteTracker, process_package
+
+@dlt.resource(
+    primary_key="id",
+    write_disposition={
+        "disposition": "merge",
+        "strategy": "upsert",
+        "delete_policy": {
+            "delete_marker_column": "is_deleted",
+            "marker_action": "soft_delete",
+            "soft_delete_column_name": "_dlt_soft_deleted",
+            "row_version_column_name": "updated_at",
+            "sync_scope": "present_only",  # default: absent rows are never deleted
+        },
+    },
+)
+def customers():
+    ...
+```
+
+### Safety rules
+
+- **No full sync declaration, no absent deletes.** A row missing from an incremental
+  (`present_only`) package is always `undetermined`, even when it was seen before. Only a
+  package with `sync_scope="full_sync"` can turn absence into a delete.
+- **Idempotent deletes.** Re-delivering a tombstone or re-running a full sync re-reports the
+  same verdict; the confirmed state does not change.
+- **Late updates cannot resurrect.** With `row_version_column_name`, an incoming row whose
+  version is not strictly newer than a confirmed soft/hard delete is `undetermined`.
+- **State persists across loads.** Keep the `DeleteTracker` (JSON-serializable) in resource
+  state and confirm verdicts only after the load commits, so a failed load never records a
+  delete that did not happen.
+
+```py
+policy = DeletePolicy.from_config(resource_config, table_name="customers")
+tracker = DeleteTracker.from_state_dict(resource.state.get("delete_tracker"))
+
+processed = process_package(policy, rows, key_columns=["id"], tracker=tracker)
+# load processed.rows_to_yield and delete processed.hard_deleted_keys ...
+for verdict in processed.verdicts:
+    tracker.confirm_verdict(
+        verdict.record_key, verdict.verdict,
+        version=verdict.version, marker_value=verdict.marker_value,
+    )
+resource.state["delete_tracker"] = tracker.to_state_dict()
+```

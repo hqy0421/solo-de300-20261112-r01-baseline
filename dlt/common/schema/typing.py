@@ -254,6 +254,15 @@ TWriteDisposition = Literal["skip", "append", "replace", "merge"]
 TLoaderMergeStrategy = Literal["delete-insert", "scd2", "upsert", "insert-only", "cdc"]
 TLoaderReplaceStrategy = Literal["truncate-and-insert", "insert-from-staging", "staging-optimized"]
 
+# what to do with a record that the delete policy classifies as deleted
+TDeleteAction = Literal["soft_delete", "hard_delete"]
+# how rows absent from a sync package may be interpreted
+TDeletionScope = Literal["present_only", "full_sync"]
+# verdict of the delete policy for a single record
+TDeleteVerdict = Literal["retain", "soft_delete", "hard_delete", "undetermined"]
+# row lifecycle state tracked for a record
+TRecordLifecycleState = Literal["active", "soft_deleted", "hard_deleted"]
+
 
 WRITE_DISPOSITIONS: Sequence[TWriteDisposition] = sorted(get_args(TWriteDisposition))
 MERGE_STRATEGIES: Sequence[TLoaderMergeStrategy] = sorted(get_args(TLoaderMergeStrategy))
@@ -265,6 +274,8 @@ MERGE_STRATEGY_OPTIONS: Dict[str, Sequence[TLoaderMergeStrategy]] = {
     "destination_scope": ("delete-insert", "scd2", "cdc"),
     "skip_unchanged_rows": UPSERT_MERGE_STRATEGIES,
     "row_version_column_name": ("scd2", "upsert", "cdc"),
+    # scd2 keeps retired versions on purpose, so a delete policy applies to the other strategies
+    "delete_policy": ("delete-insert", "upsert", "cdc"),
 }
 """Merge strategy options and the strategies that support them."""
 MERGE_DISPOSITION_HINTS: Dict[str, str] = {
@@ -273,6 +284,7 @@ MERGE_DISPOSITION_HINTS: Dict[str, str] = {
     "source_filter": "x-merge-source-filter",
     "destination_scope": "x-merge-destination-scope",
     "skip_unchanged_rows": "x-merge-skip-unchanged-rows",
+    "delete_policy": "x-delete-policy",
 }
 """Table hints that store the keys of the merge write disposition dict. The column names in the
 dict, like `row_version_column_name`, mark their columns with column hints instead."""
@@ -286,9 +298,42 @@ class TWriteDispositionDict(TypedDict):
     disposition: TWriteDisposition
 
 
+class TDeletePolicyDict(TypedDict):
+    """Optional policy that decides whether source records are soft-deleted, hard-deleted or
+    left undetermined.
+
+    The policy is **disabled by default**. Records that do not carry a delete marker are never
+    treated as deleted unless `sync_scope` is explicitly set to `"full_sync"`: without a complete
+    sync declaration, rows absent from a package are reported as `undetermined` and stay untouched.
+    """
+
+    delete_marker_column: NotRequired[str]
+    """Source column that flags records as invalidated (deletion flag / tombstone). Rows with a
+    truthy marker (`True`, non-zero number, non-empty value or non-`NULL` value) are classified
+    with `marker_action`; rows without the marker keep their previous lifecycle state."""
+    marker_action: NotRequired[TDeleteAction]
+    """Action applied to marker-flagged records. Defaults to `"soft_delete"`."""
+    absent_action: NotRequired[TDeleteAction]
+    """Action applied to records seen before but missing from a package when `sync_scope` is
+    `"full_sync"`. Defaults to `"hard_delete"`. Ignored for `present_only` packages, where
+    absent records are always `undetermined`."""
+    sync_scope: NotRequired[TDeletionScope]
+    """`"present_only"` (default): only records present in the package are judged, absent records
+    stay `undetermined`. `"full_sync"`: the package claims to contain the complete record set, so
+    previously seen but absent records are classified with `absent_action`."""
+    soft_delete_column_name: NotRequired[str]
+    """Destination column set to the (truthy) marker value or `True` on soft deletes. Required
+    when any path can produce a soft delete."""
+    row_version_column_name: NotRequired[str]
+    """Optional column versioning the record. A package row whose version is not newer than the
+    version of an already confirmed (soft- or hard-deleted) record cannot revive it: the stale
+    row is reported as `undetermined` instead."""
+
+
 class TMergeDispositionDict(TWriteDispositionDict):
     strategy: NotRequired[TLoaderMergeStrategy]
     """The destination picks its default strategy when not set."""
+    delete_policy: NotRequired[TDeletePolicyDict]
 
 
 class TReplaceDispositionDict(TWriteDispositionDict):
@@ -318,6 +363,7 @@ class TDeleteInsertStrategyDict(
 ):
     strategy: Literal["delete-insert"]
     deduplicated: NotRequired[bool]
+    delete_policy: NotRequired[TDeletePolicyDict]
 
 
 class TScd2StrategyDict(
@@ -345,6 +391,7 @@ class TUpsertStrategyDict(
     TWriteDispositionDict, TSourceFilterDict, TMergeConditionPlaceholdersDict, TUpsertOptionsDict
 ):
     strategy: Literal["upsert"]
+    delete_policy: NotRequired[TDeletePolicyDict]
 
 
 class TCdcStrategyDict(
@@ -355,6 +402,7 @@ class TCdcStrategyDict(
     TUpsertOptionsDict,
 ):
     strategy: Literal["cdc"]
+    delete_policy: NotRequired[TDeletePolicyDict]
 
 
 TWriteDispositionConfig = Union[

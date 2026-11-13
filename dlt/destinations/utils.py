@@ -349,6 +349,21 @@ def verify_schema_merge_disposition(
                     " destination scope selects the destination records to delete or retire, so"
                     " dlt ignores `merge_key`."
                 )
+            if delete_policy := table.get("x-delete-policy"):
+                try:
+                    from dlt.common.deletes.validation import validate_delete_policy_config
+
+                    validate_delete_policy_config(
+                        cast(Dict[str, Any], delete_policy),
+                        table_name=table_name,
+                        columns=table["columns"],
+                        strategy=merge_strategy,
+                        check_columns=True,
+                    )
+                except Exception as policy_ex:
+                    exception_log.append(
+                        SchemaCorruptedException(schema.name, str(policy_ex))
+                    )
         if has_column_with_prop(table, "hard_delete"):
             if len(get_columns_names_with_prop(table, "hard_delete")) > 1:
                 exception_log.append(

@@ -954,6 +954,16 @@ class DltResourceHints:
                     " row version, set `skip_unchanged_rows` to `True`."
                 )
 
+            if delete_policy := md.get("delete_policy"):
+                from dlt.common.deletes.validation import validate_delete_policy_config
+
+                validate_delete_policy_config(
+                    cast(Dict[str, Any], delete_policy),
+                    table_name=template.get("table_name"),
+                    columns=template.get("columns"),
+                    strategy=strategy,
+                )
+
             if strategy == "scd2":
                 for ts in ("active_record_timestamp", "boundary_timestamp"):
                     if (
